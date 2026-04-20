@@ -342,7 +342,7 @@ scatter_plot <- ggplot(plot_df, aes(x = density, y = pg_ml,
     # ---- General spacing ----
     plot.margin = margin(10, 10, 10, 10)
   )
-  theme_classic()
+theme_classic()
 
 ggsave(
   filename = "scatter_plot_density_vs_antigens_saturated.png",
