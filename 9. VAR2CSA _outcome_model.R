@@ -521,15 +521,15 @@ plot_contrast_curves <- function(curves_df, labels_df, title_txt, colour_hex, x_
                 aes(ymin = lower, ymax = upper), fill = colour_hex, alpha = 0.30, colour = NA) +
     geom_ribbon(data = curves_df %>% dplyr::filter(sig_neg),
                 aes(ymin = lower, ymax = upper), fill = colour_hex, alpha = 0.30, colour = NA) +
-    geom_line(aes(y = diff), colour = colour_hex, linewidth = 0.9) +
-    geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.5) +
+    geom_line(aes(y = diff), colour = colour_hex, linewidth = 1.0) +
+    geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.6) +
     
     geom_vline(
       data = vlines_df,
       aes(xintercept = x_raw),
       inherit.aes = FALSE,
       linetype = "dotted",
-      linewidth = 0.45,
+      linewidth = 0.5,
       colour = "black",
       alpha = 0.65
     ) +
@@ -538,24 +538,26 @@ plot_contrast_curves <- function(curves_df, labels_df, title_txt, colour_hex, x_
       data = labels_df,
       aes(x = x_raw, y = y, label = label, hjust = hjust),
       inherit.aes = FALSE,
-      size  = 3.5,
+      size  = 4.2,
       vjust = 0.5,
       color = "black",
-      lineheight = 0.92,
+      lineheight = 0.95,
       check_overlap = FALSE
     ) +
     
     scale_x_log10(labels = scales::label_number(accuracy = 0.01, big.mark = ",")) +
     labs(title = title_txt, x = x_label, y = y_label_txt) +
-    theme_classic(base_size = 12) +
+    theme_classic(base_size = 14) +
     theme(
       panel.grid.major = element_blank(),
       panel.grid.minor = element_blank(),
-      panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.6),
-      strip.background = element_rect(fill = "white", colour = "black", linewidth = 0.6),
-      strip.text = element_text(face = "bold", size = 11, color = "black"),
-      plot.title = element_text(face = "bold", size = 14, color = "black"),
-      plot.margin = margin(8, 10, 8, 8)
+      panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.7),
+      strip.background = element_rect(fill = "white", colour = "black", linewidth = 0.7),
+      strip.text = element_text(face = "bold", size = 13, color = "black"),
+      plot.title = element_text(face = "bold", size = 17, color = "black"),
+      axis.title = element_text(size = 15, color = "black"),
+      axis.text = element_text(size = 12.5, color = "black"),
+      plot.margin = margin(10, 12, 10, 10)
     )
 }
 
@@ -953,23 +955,26 @@ p_c <- png_to_gg(f_c) + labs(tag = "c")
 
 top_row <- wrap_plots(p_a, p_b, ncol = 2)
 
-## Bottom row: spacer | C | spacer, with widths 1:2:1
-## => C takes 2/(1+2+1) = 0.5 of the total width (same as A or B)
-bottom_row <- wrap_plots(plot_spacer(), p_c, plot_spacer(),
-                         ncol = 3, widths = c(1, 2, 1))
+## Bottom row: panel c aligned to the left, blank space on the right
+bottom_row <- wrap_plots(
+  p_c,
+  plot_spacer(),
+  ncol = 2,
+  widths = c(1, 1)
+)
 
 p_3panel <- top_row / bottom_row &
   theme(
-    plot.tag = element_text(face = "bold", size = 16),
+    plot.tag = element_text(face = "bold", size = 18),
     plot.tag.position = c(0.02, 0.98)
   )
 
 print(p_3panel)
 
-ggsave("HASTA_DESDE_3PANEL_a_b_c_centered.png", p_3panel, width = 16, height = 14, dpi = 300)
-ggsave("HASTA_DESDE_3PANEL_a_b_c_centered.pdf", p_3panel, width = 16, height = 14)
+ggsave("HASTA_DESDE_3PANEL_a_b_c_leftaligned.png", p_3panel, width = 16, height = 14, dpi = 300)
+ggsave("HASTA_DESDE_3PANEL_a_b_c_leftaligned.pdf", p_3panel, width = 16, height = 14)
 
-cat("Saved:\n - HASTA_DESDE_3PANEL_a_b_c_centered.png\n - HASTA_DESDE_3PANEL_a_b_c_centered.pdf\n")
+cat("Saved:\n - HASTA_DESDE_3PANEL_a_b_c_leftaligned.png\n - HASTA_DESDE_3PANEL_a_b_c_leftaligned.pdf\n")
 
 ## ============================================================
 ## 6) MAGNITUDE (VAR2CSA) within significant hasta/desde regions

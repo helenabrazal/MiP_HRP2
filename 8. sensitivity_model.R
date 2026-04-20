@@ -760,15 +760,15 @@ plot_contrast_curves <- function(curves_df, labels_df, title_txt, colour_hex, x_
                 aes(ymin = lower, ymax = upper), fill = colour_hex, alpha = 0.30, colour = NA) +
     geom_ribbon(data = curves_df %>% dplyr::filter(sig_neg),
                 aes(ymin = lower, ymax = upper), fill = colour_hex, alpha = 0.30, colour = NA) +
-    geom_line(aes(y = diff), colour = colour_hex, linewidth = 0.9) +
-    geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.5) +
+    geom_line(aes(y = diff), colour = colour_hex, linewidth = 1.0) +
+    geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.6) +
     
     geom_vline(
       data = vlines_df,
       aes(xintercept = x_raw),
       inherit.aes = FALSE,
       linetype = "dotted",
-      linewidth = 0.45,
+      linewidth = 0.5,
       colour = "black",
       alpha = 0.65
     ) +
@@ -777,24 +777,26 @@ plot_contrast_curves <- function(curves_df, labels_df, title_txt, colour_hex, x_
       data = labels_df,
       aes(x = x_raw, y = y, label = label, hjust = hjust),
       inherit.aes = FALSE,
-      size  = 3.5,
+      size  = 4.2,
       vjust = 0.5,
       color = "black",
-      lineheight = 0.92,
+      lineheight = 0.95,
       check_overlap = FALSE
     ) +
     
     scale_x_log10(labels = scales::label_number(accuracy = 0.01, big.mark = ",")) +
     labs(title = title_txt, x = x_label, y = y_expr) +
-    theme_classic(base_size = 12) +
+    theme_classic(base_size = 14) +
     theme(
       panel.grid.major = element_blank(),
       panel.grid.minor = element_blank(),
-      panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.6),
-      strip.background = element_rect(fill = "white", colour = "black", linewidth = 0.6),
-      strip.text = element_text(face = "bold", size = 11, color = "black"),
-      plot.title = element_text(face = "bold", size = 14, color = "black"),
-      plot.margin = margin(8, 10, 8, 8)
+      panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.7),
+      strip.background = element_rect(fill = "white", colour = "black", linewidth = 0.7),
+      strip.text = element_text(face = "bold", size = 13, color = "black"),
+      plot.title = element_text(face = "bold", size = 17, color = "black"),
+      axis.title = element_text(size = 15, color = "black"),
+      axis.text = element_text(size = 12.5, color = "black"),
+      plot.margin = margin(10, 12, 10, 10)
     )
 }
 
@@ -896,8 +898,8 @@ run_hasta_desde_primi_anchor_vs_all <- function(model_obj, marker_tag, colour_he
   
   out_png <- paste0("HASTA_DESDE_", marker_tag, "_qPCRdensity_PrimiAnchorVsAll_IJ_facets_PCRpos_CommonSupport.png")
   out_pdf <- paste0("HASTA_DESDE_", marker_tag, "_qPCRdensity_PrimiAnchorVsAll_IJ_facets_PCRpos_CommonSupport.pdf")
-  ggsave(out_png, p_IJ, width = 11, height = 10, dpi = 300)
-  ggsave(out_pdf, p_IJ, width = 11, height = 10)
+  ggsave(out_png, p_IJ, width = 12.5, height = 10.5, dpi = 300)
+  ggsave(out_pdf, p_IJ, width = 12.5, height = 10.5)
   
   cat("Saved:\n  -", out_png, "\n  -", out_pdf, "\n")
   
