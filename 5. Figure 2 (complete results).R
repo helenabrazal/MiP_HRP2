@@ -293,14 +293,55 @@ scatter_plot <- ggplot(plot_df, aes(x = density, y = pg_ml,
   ) +
   theme_bw() +
   theme(
-    plot.title = element_text(hjust = 0.5, size = 11, face = "bold"),
+    # ---- Plot title ----
+    plot.title = element_text(
+      hjust = 0.5,
+      size = 20,
+      face = "bold"
+    ),
+    
+    # ---- Axis titles ----
+    axis.title.x = element_text(
+      size = 18,
+      face = "bold",
+      margin = margin(t = 10)
+    ),
+    axis.title.y = element_text(
+      size = 18,
+      face = "bold",
+      margin = margin(r = 10)
+    ),
+    
+    # ---- Axis tick labels ----
+    axis.text.x = element_text(
+      size = 14,
+      face = "bold"
+    ),
+    axis.text.y = element_text(
+      size = 14,
+      face = "bold"
+    ),
+    
+    # ---- Grid ----
     panel.grid.major = element_line(color = "grey95"),
     panel.grid.minor = element_blank(),
-    legend.position  = "right",
-    legend.margin    = margin(10, 10, 10, 10),
-    legend.text      = element_text(size = 25),
-    legend.title     = element_text(size = 20, face = "bold")
-  )+
+    
+    # ---- Legend ----
+    legend.position = "right",
+    legend.title = element_text(
+      size = 22,
+      face = "bold"
+    ),
+    legend.text = element_text(
+      size = 18
+    ),
+    legend.key.size = unit(1.5, "cm"),
+    legend.spacing.y = unit(0.4, "cm"),
+    legend.margin = margin(10, 10, 10, 10),
+    
+    # ---- General spacing ----
+    plot.margin = margin(10, 10, 10, 10)
+  )
   theme_classic()
 
 ggsave(
