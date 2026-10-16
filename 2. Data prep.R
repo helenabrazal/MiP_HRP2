@@ -1,8 +1,18 @@
 ## The aim of this script will be to rename variables of epi data
 ## for data interpretation before merging with interpolated variables
+##
+## CHANGE: a single vector_control variable is created at the end,
+## replacing net and fumig. Those two carry 999 on exactly the same
+## rows, so a model containing both aliases one of them. Downstream
+## scripts should use vector_control only.
 
-# Set the working directory
-setwd("C:/HRP2 analysis/PhD_HRP2_qPCR")
+## ---- paths ----
+## Inputs live where the raw files are; the output goes to the
+## manuscript folder, which is where the analysis scripts read from.
+INPUT_DIR <- "C:/HRP2 analysis/PhD_HRP2_qPCR"
+OUT_FILE  <- "C:/HRP2 analysis/MiP_HRP2_manuscriptcodes/MiP_HRP2/ANC_recoded.csv"
+
+setwd(INPUT_DIR)
 
 # Install pacman if not already installed
 if (!require("pacman")) install.packages("pacman")
@@ -137,12 +147,6 @@ safe_log10p1 <- function(x) {
   suppressWarnings(ifelse(is.na(x_num) | x_num < 0, NA_real_, log10(x_num + 1)))
 }
 
-# df: data frame
-# antigen_vec: vector of antigen column names
-# out_name: name of composite output column
-# min_count: minimum per-antigen count to be included in the composite for that row
-# center: if TRUE, mean-center the composite (subtract global mean); no scaling
-# keep_log_cols: if TRUE, keep the temporary log_ columns in output
 make_composite <- function(df, antigen_vec, out_name, min_count = 20,
                            center = FALSE, keep_log_cols = FALSE) {
   
@@ -287,7 +291,7 @@ data_recoded <- data_recoded %>%
   mutate(
     Period = dplyr::recode_factor(
       as.character(period_proj),
-      `0` = "Nov. 2016–Oct. 2017",
+      `0` = "Nov. 2016-Oct. 2017",
       `1` = "Nov. 2017-Oct. 2018 ",
       `2` = "Nov. 2018-Oct. 2019",
       .default = NA_character_
@@ -308,19 +312,79 @@ data_recoded <- data_recoded %>%
                        ifelse(!is.na(age), "18 and older", NA_character_))
   )
 
-## add saturation vars (kept commented as in your original script)
-# data_recoded <- data_recoded %>%
-#   dplyr::mutate(
-#     pfhrp2_saturation = dplyr::if_else(is.na(pfhrp2), NA_character_,
-#                                       dplyr::if_else(pfhrp2 > 18235.8, "Yes", "No")),
-#     pfldh_saturation  = dplyr::if_else(is.na(pfldh), NA_character_,
-#                                       dplyr::if_else(pfldh > 20637.9, "Yes", "No")),
-#     pvldh_saturation  = dplyr::if_else(is.na(pvldh), NA_character_,
-#                                       dplyr::if_else(pvldh > 21472.2, "Yes", "No"))
-#   )
+# ----------- Vector control -----------
+#
+# net and fumig carry 999 on exactly the same rows, so a model
+# containing both aliases one of them: the 999 indicators are the
+# same column. They are therefore combined into a single variable
+# counting how many measures the household reported.
+#
+#   0 measures     neither bed net nor indoor spraying
+#   1 measure      one of the two
+#   2 measures     both
+#   Undetermined   999 in both, meaning not established
+#
+# The count is kept rather than collapsed to yes/no, because one
+# measure and two measures are not the same exposure. 999 is kept
+# as its own level rather than merged into "yes", because its
+# meaning is not settled and merging would assert one.
+#
+# Downstream scripts use vector_control and should not use net or
+# fumig directly.
+
+yesno01 <- function(x) {
+  s <- trimws(as.character(x))
+  dplyr::case_when(
+    s %in% c("1", "Yes", "yes") ~ 1L,
+    s %in% c("0", "No",  "no")  ~ 0L,
+    TRUE                        ~ NA_integer_
+  )
+}
+
+data_recoded <- data_recoded %>%
+  mutate(
+    .net_999   = trimws(as.character(net))   == "999",
+    .fumig_999 = trimws(as.character(fumig)) == "999",
+    .net_n     = yesno01(net),
+    .fumig_n   = yesno01(fumig),
+    
+    vector_control = case_when(
+      .net_999 | .fumig_999            ~ "Undetermined",
+      is.na(.net_n) | is.na(.fumig_n)  ~ NA_character_,
+      .net_n + .fumig_n == 0           ~ "0 measures",
+      .net_n + .fumig_n == 1           ~ "1 measure",
+      .net_n + .fumig_n == 2           ~ "2 measures",
+      TRUE                             ~ NA_character_
+    ),
+    
+    vector_control = factor(
+      vector_control,
+      levels = c("0 measures", "1 measure", "2 measures", "Undetermined")
+    )
+  ) %>%
+  select(-.net_999, -.fumig_999, -.net_n, -.fumig_n)
+
+message("Vector control:")
+print(table(data_recoded$vector_control, useNA = "ifany"))
+
+# Does 999 fall on the same rows in both? If it does, that is why
+# the two variables cannot both be fitted, and it is worth seeing.
+n_both <- sum(trimws(as.character(data_recoded$net))   == "999" &
+                trimws(as.character(data_recoded$fumig)) == "999", na.rm = TRUE)
+n_net  <- sum(trimws(as.character(data_recoded$net))   == "999", na.rm = TRUE)
+n_fum  <- sum(trimws(as.character(data_recoded$fumig)) == "999", na.rm = TRUE)
+message("999 in net: ", n_net, " | in fumig: ", n_fum, " | in both: ", n_both)
+if (n_both == n_net && n_both == n_fum) {
+  message("The two 999 patterns are identical, as expected.")
+} else {
+  message("The patterns differ. Check before relying on vector_control.")
+}
 
 write.csv(
   data_recoded,
-  file = "C:/HRP2 analysis/PhD_HRP2_qPCR/ANC_recoded.csv",
+  file = OUT_FILE,
   row.names = FALSE
 )
+
+message("Written: ", OUT_FILE)
+message("Rows: ", nrow(data_recoded), " | Columns: ", ncol(data_recoded))

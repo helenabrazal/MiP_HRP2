@@ -349,7 +349,7 @@ ggsave(
   plot = scatter_plot,
   width = 10,
   height = 8,
-  dpi = 600,
+  dpi = 700,
   units = "in"
 )
 

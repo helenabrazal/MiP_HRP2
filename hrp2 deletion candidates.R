@@ -3,11 +3,17 @@
 ##  - First ANC only
 ##  - PCR-positive samples
 ##  - Uses PfHRP2_pg.ml (HRP2) and PfLDH_pg.ml (PfLDH)
+##
+## ADDED: a breakdown of the samples screened for hrp2/3
+## deletions by gravidity and by health centre, which is what
+## reviewer point 9 asks for. Nothing in the selection logic
+## has been changed, so the candidate list is identical to
+## before; the breakdown is counted from that same list.
 ############################################################
 
 ## ---------- Setup ----------
 if (!require("pacman")) install.packages("pacman")
-pacman::p_load(dplyr, ggplot2, broom, ggrepel)
+pacman::p_load(dplyr, ggplot2, broom, ggrepel, tidyr)
 
 ## ---------- Paths ----------
 # Change this if needed
@@ -15,6 +21,7 @@ setwd("C:/HRP2 analysis/PhD_HRP2_qPCR")
 
 infile <- "ANC_recoded.csv"
 outfile_candidates <- "low_HRP2_residual_candidates.csv"
+outfile_breakdown  <- "hrp23_screening_breakdown.csv"
 
 ## ---------- 1) Read data and keep first ANC ----------
 anc <- read.csv(infile, stringsAsFactors = FALSE)%>%
@@ -28,6 +35,15 @@ anc <- anc %>%
 # names(anc)
 
 ## ---------- 2) Keep PCR-positive samples and relevant columns ----------
+##
+## gravidity and centro are carried through here so that the
+## candidates can be counted by group further down. If either
+## column is named differently in your file, change it here only.
+
+GRAV_COL <- "gravidity"
+SITE_COL <- "centro"
+
+stopifnot(all(c(GRAV_COL, SITE_COL) %in% names(anc)))
 
 pcr_df <- anc %>%
   filter(pcrpos == 1) %>%
@@ -38,7 +54,9 @@ pcr_df <- anc %>%
     PfHRP2_pg.ml,
     PfLDH_pg.ml,
     pfhrp2_detection,
-    pfldh_detection
+    pfldh_detection,
+    gravidity = all_of(GRAV_COL),
+    centro    = all_of(SITE_COL)
   ) %>%
   rename(
     hrp2_value  = PfHRP2_pg.ml,
@@ -90,7 +108,7 @@ pcr_df <- pcr_df %>%
     log_density = log10(density_for_model)
   )
 
-## ---------- 4) Fit log–log regression and get residuals ----------
+## ---------- 4) Fit log-log regression and get residuals ----------
 
 model_hrp2_density <- lm(log_hrp2 ~ log_density, data = pcr_df)
 
@@ -111,6 +129,8 @@ low_hrp2_dataset <- pcr_aug %>%
   select(
     nida,
     pcrpos,
+    gravidity,
+    centro,
     density,
     hrp2_value,
     pfhrp2_detection,
@@ -129,6 +149,93 @@ print(low_hrp2_dataset)
 # Just the NIDAs if you want to copy/paste somewhere
 low_hrp2_nidas <- low_hrp2_dataset %>% pull(nida)
 print(low_hrp2_nidas)
+
+## ============================================================
+## 5b) BREAKDOWN OF THE SCREENED SAMPLES  (reviewer point 9)
+##
+## Three counts, because the reviewer's objection is that "no
+## evidence of deletions in this population" overstates what a
+## targeted screen can show:
+##
+##   eligible  = PCR-positive first-ANC samples the candidate
+##               selection drew from, i.e. the denominator
+##   screened  = the k candidates actually sent for screening
+##   coverage  = screened / eligible within each group, which is
+##               the number that shows how little of each group
+##               was looked at
+##
+## Counted by gravidity, by site, and by the two together.
+## ============================================================
+
+cat("\n============================================================\n")
+cat("hrp2/3 DELETION SCREENING: BREAKDOWN OF SAMPLES SCREENED\n")
+cat("============================================================\n")
+
+breakdown_block <- function(by_vars, label) {
+  elig <- pcr_aug %>% count(across(all_of(by_vars)), name = "eligible")
+  scrn <- low_hrp2_dataset %>% count(across(all_of(by_vars)), name = "screened")
+  
+  out <- elig %>%
+    left_join(scrn, by = by_vars) %>%
+    mutate(
+      screened = tidyr::replace_na(screened, 0L),
+      pct_of_group_screened = round(100 * screened / eligible, 1),
+      pct_of_screened       = round(100 * screened / sum(screened), 1),
+      grouping              = label
+    ) %>%
+    arrange(desc(screened))
+  
+  cat("\n---", label, "---\n")
+  print(as.data.frame(out), row.names = FALSE)
+  
+  # a common shape so the three blocks can be stacked into one file
+  out %>%
+    mutate(
+      gravidity = if ("gravidity" %in% by_vars) as.character(gravidity) else "All",
+      centro    = if ("centro"    %in% by_vars) as.character(centro)    else "All"
+    ) %>%
+    select(grouping, gravidity, centro, eligible, screened,
+           pct_of_group_screened, pct_of_screened)
+}
+
+bd <- dplyr::bind_rows(
+  breakdown_block("gravidity",            "By gravidity"),
+  breakdown_block("centro",               "By health centre"),
+  breakdown_block(c("centro","gravidity"), "By centre and gravidity")
+)
+
+## Overall line, so the totals are explicit and nothing has to be
+## added up by hand.
+bd <- dplyr::bind_rows(
+  tibble::tibble(
+    grouping = "Overall", gravidity = "All", centro = "All",
+    eligible = nrow(pcr_aug), screened = nrow(low_hrp2_dataset),
+    pct_of_group_screened = round(100 * nrow(low_hrp2_dataset) / nrow(pcr_aug), 1),
+    pct_of_screened = 100
+  ),
+  bd
+)
+
+cat("\n--- Overall ---\n")
+cat("Eligible (PCR-positive, first ANC, bead count >= 20):", nrow(pcr_aug), "\n")
+cat("Screened (k lowest HRP2 residuals):                  ", nrow(low_hrp2_dataset), "\n")
+
+## The supplementary figure legend states that samples below
+## 10 parasites/uL were excluded from deletion screening. This
+## script applies no such filter, so if the published screen did
+## exclude them the counts below will not match. Reported rather
+## than silently corrected.
+n_below_10 <- sum(low_hrp2_dataset$density < 10, na.rm = TRUE)
+cat("Of the screened candidates,", n_below_10,
+    "have density < 10 parasites/uL.\n")
+if (n_below_10 > 0) {
+  cat("NOTE: Supplementary Figure 1 says densities < 10 parasites/uL were\n")
+  cat("      excluded from deletion screening. This script does not apply\n")
+  cat("      that filter. Check which is right before reporting counts.\n")
+}
+
+write.csv(bd, outfile_breakdown, row.names = FALSE)
+cat("\nSaved breakdown to:", outfile_breakdown, "\n")
 
 ## ---------- 6) Plot HRP2 vs density with lowest residuals highlighted ----------
 lowest_residuals <- ggplot(pcr_aug, aes(x = density_for_model, y = hrp2_for_model)) +
@@ -155,7 +262,7 @@ lowest_residuals <- ggplot(pcr_aug, aes(x = density_for_model, y = hrp2_for_mode
   ) +
   theme_bw() +
   theme(
-    # keep title as-is (don’t set plot.title)
+    # keep title as-is (don't set plot.title)
     axis.title.x = element_text(size = 16),
     axis.title.y = element_text(size = 16),
     axis.text.x  = element_text(size = 14),
@@ -174,6 +281,20 @@ ggsave(
   width = 14.0, height = 8, dpi = 400
 )
 
+## ---------- 6b) The same plot, faceted by gravidity ----------
+## Same points, split so the figure shows which group the
+## candidates came from rather than only where they sit.
+lowest_residuals_by_gravidity <- lowest_residuals +
+  facet_wrap(~ gravidity) +
+  labs(subtitle = paste0(
+    "Red points = lowest HRP2 residuals, by gravidity (n screened = ",
+    nrow(low_hrp2_dataset), ")"))
+
+ggsave(
+  "C:/HRP2 analysis/PhD_HRP2_qPCR/hrp23_deletion_candidates_by_gravidity.png",
+  lowest_residuals_by_gravidity,
+  width = 14.0, height = 8, dpi = 400
+)
 
 ## ---------- 7) Save candidate dataset ----------
 
