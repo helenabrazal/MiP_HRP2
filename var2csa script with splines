@@ -1,0 +1,1326 @@
+## ============================================================
+## SCRIPT 2 — VAR2CSA / Cumulative antibodies as outcomes
+## ALIGNED WITH THE ANTIGEN SCRIPTS
+##
+## WHY NO LEFT CENSORING HERE
+##   In the antigen scripts the antigen is the OUTCOME, so a value
+##   below the LLOQ can be handled as an interval and survreg uses
+##   it properly. Here the antigen is a PREDICTOR, and censoring a
+##   predictor is a different and much harder problem; survreg only
+##   censors the response.
+##
+##   But the issue does not disappear: sub-LLOQ concentrations are
+##   still entering the model as if they were reliable measurements,
+##   when below that limit the interpolated value is blank noise
+##   pushed through the standard curve. The standard treatment for a
+##   censored PREDICTOR is substitution at LLOQ/sqrt(2), which is
+##   what SUB_BELOW_LLOQ does. Set it to FALSE to keep the previous
+##   behaviour and compare.
+##
+## WHAT IS NOW THE SAME AS THE ANTIGEN SCRIPTS
+##   - automated LRT screening of HIV x predictor and gestweeks x
+##     predictor; the predictor x gravidity x site term is retained
+##     a priori because it is the primary hypothesis
+##   - cubic-spline refit of the selected structure, with an AIC
+##     comparison against the linear form (reviewer point 6)
+##   - SIMULTANEOUS 95% confidence bands across the predictor curve
+##     instead of 200 pointwise intervals (reviewer point 5)
+##   - common support as a switch: restrict the prediction grid, not
+##     necessarily the data
+##   - within-site gravidity contrasts available (reviewer point 7)
+##   - aliased coefficients excluded from every contrast
+##   - net and fumig left as the recoding script delivers them,
+##     where 999 was already merged into "yes"
+## ============================================================
+
+## ---------- Setup ----------
+
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+pacman::p_load(
+  dplyr, readr, tidyr, tibble,
+  ggplot2, ggtext, patchwork,
+  broom, emmeans, car, scales,
+  grid, png, splines
+)
+
+## MASS only by namespace: attaching it masks dplyr::select
+if (!requireNamespace("MASS", quietly = TRUE)) install.packages("MASS")
+
+ambar <- "#e2943a"
+morado <- "#6A3D9A"
+blue  <- "#1f78b4"
+
+## ============================================================
+## OPTIONS
+## ============================================================
+
+## "primi_vs_all" the original set: each Primi group against every
+##                other group, 12 contrasts. With KEY_CENTRE below,
+##                the figures show the 7 involving that centre, which
+##                is the layout of the published figure.
+## "within_site"  primigravidae vs multigravidae inside each site,
+##                3 contrasts, reviewer point 7
+##
+## Both sets are run in one pass. The antigen analysis reports the
+## twelve-contrast set and the within-site set alongside each other,
+## so the antibody figures have to exist for both or the two analyses
+## cannot be compared. Every file written carries the set in its name,
+## so nothing from one pass overwrites the other. To run a single set,
+## shorten this vector.
+CONTRAST_SETS <- c("primi_vs_all", "within_site")
+
+## Assigned by the loop in section 6, which is where make_methods(),
+## build_pairs() and run_hasta_desde() read it from. The value set
+## here only matters if one of them is called before that loop runs.
+CONTRAST_SET <- CONTRAST_SETS[1]
+
+## FALSE fits on everything and restricts only the prediction grid
+APPLY_COMMON_SUPPORT_TO_DATA <- FALSE
+
+## substitute sub-LLOQ antigen predictor values at LLOQ/sqrt(2)
+SUB_BELOW_LLOQ <- TRUE
+
+## drop HRP2-saturated samples from the HRP2-predictor models, as
+## the original script did
+DROP_HRP2_SATURATED <- TRUE
+
+## Which contrasts the hasta/desde FIGURE draws. The CSV files always
+## contain all twelve. Set this to a centre name to draw only the
+## contrasts involving that centre; NA draws every one, which is what
+## the Results report and what Supplementary Table 7 lists, so a range
+## in the table always has a panel to go with it. Filtering the figure
+## while the table lists everything is what made a reported range look
+## as though it had come from nowhere. Ignored for the within-site set,
+## where three contrasts fit comfortably.
+KEY_CENTRE <- NA
+
+SPLINE_DF <- 3
+NSIM_BAND <- 5000
+SEED_BAND <- 20261002
+
+HRP2_LLOQ_PGML  <- 0.0034846
+PFLDH_LLOQ_PGML <- 0.034846
+
+## ---------- Read data ----------
+## ============================================================
+## OUTPUT FOLDER
+##
+## The data are read by ABSOLUTE path and the working directory is
+## then moved to the output folder, so every write.csv, ggsave,
+## saveRDS, write_csv_utf8_bom and PNG read-back lands there without
+## touching a single output filename. Running the three scripts on
+## the same day fills one folder.
+## ============================================================
+PROJECT_DIR <- "C:/HRP2 analysis/MiP_HRP2_manuscriptcodes/MiP_HRP2"
+RUN_TAG     <- format(Sys.Date(), "%Y%m%d")
+OUTDIR      <- file.path(PROJECT_DIR, "resultados", RUN_TAG)
+SCRIPT_TAG  <- "antibodies_VAR2CSA"
+
+dir.create(OUTDIR, recursive = TRUE, showWarnings = FALSE)
+
+data <- read.csv(file.path(PROJECT_DIR, "ANC_recoded.csv"),
+                 stringsAsFactors = FALSE, check.names = FALSE)
+
+setwd(OUTDIR)
+
+cat("\n================ OUTPUT =================\n")
+cat("Script    :", SCRIPT_TAG, "\n")
+cat("Project   :", PROJECT_DIR, "\n")
+cat("Writing   :", OUTDIR, "\n")
+cat("Input rows:", nrow(data), "\n")
+
+## ============================================================
+## VECTOR CONTROL
+##
+## Built in the data preparation script, not here, so that the
+## three analysis scripts cannot drift apart. It replaces net and
+## fumig, which carry 999 on exactly the same rows and therefore
+## cannot both be fitted: their 999 indicators are the same
+## column and a model containing both aliases one of them.
+##
+## Levels: 0 measures / 1 measure / 2 measures / Undetermined.
+##
+## FOR THE LIMITATIONS: Undetermined is not evenly spread. It
+## runs from 25.7% to 53.9% across the six gravidity-by-site
+## cells and is commoner in multigravidae at every site, so it is
+## partly a group indicator. Including it changes no contrast
+## materially (median 8.8%, no change in significance), but the
+## point belongs in the text.
+## ============================================================
+if (!"vector_control" %in% names(data)) {
+  stop("vector_control is missing. Run the data preparation script ",
+       "(2_Data_prep_vectorcontrol.R) before this one.")
+}
+
+data$vector_control <- factor(
+  data$vector_control,
+  levels = c("0 measures", "1 measure", "2 measures", "Undetermined"))
+
+cat("\n================ VECTOR CONTROL =================\n")
+print(table(data$vector_control, useNA = "ifany"))
+
+writeLines(
+  c(paste("script:", SCRIPT_TAG),
+    paste("run:", format(Sys.time())),
+    paste("R:", R.version.string),
+    paste("input:", file.path(PROJECT_DIR, "ANC_recoded.csv"))),
+  con = paste0("RUNLOG_", SCRIPT_TAG, "_",
+               format(Sys.time(), "%H%M%S"), ".txt")
+)
+
+## ============================================================
+## 0) Helpers
+## ============================================================
+safe_log1p <- function(x) {
+  suppressWarnings(ifelse(is.na(x) | x < 0, NA_real_, log1p(x)))
+}
+
+## only non-aliased coefficients and the matching covariance block.
+## One NA in beta makes xd %*% beta NA at every grid point, silently.
+usable <- function(model) {
+  if (is.null(model)) return(NULL)
+  beta <- tryCatch(stats::coef(model), error = function(e) NULL)
+  V    <- tryCatch(stats::vcov(model), error = function(e) NULL)
+  if (is.null(beta) || is.null(V) || length(beta) == 0) return(NULL)
+  
+  keep <- is.finite(beta) & names(beta) %in% rownames(V)
+  if (!any(keep)) return(NULL)
+  
+  nm <- names(beta)[keep]
+  list(beta = beta[keep], V = V[nm, nm, drop = FALSE], names = nm)
+}
+
+apply_common_support <- function(df,
+                                 x = "c_log_density",
+                                 group_vars = c("gravidity", "centro"),
+                                 probs = c(0.05, 0.95),
+                                 restrict = TRUE) {
+  stopifnot(x %in% names(df))
+  
+  rng <- df %>%
+    dplyr::filter(is.finite(.data[[x]]), !is.na(.data[[x]])) %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(group_vars))) %>%
+    dplyr::summarise(
+      q_low  = as.numeric(stats::quantile(.data[[x]], probs[1], na.rm = TRUE)),
+      q_high = as.numeric(stats::quantile(.data[[x]], probs[2], na.rm = TRUE)),
+      n_grp  = dplyr::n(), .groups = "drop")
+  
+  if (nrow(rng) < 2) {
+    warning("Common support: <2 groups for ", x, "; skipping.")
+    return(list(df = df, c_low = NA_real_, c_high = NA_real_, rng = rng))
+  }
+  
+  c_low  <- suppressWarnings(max(rng$q_low,  na.rm = TRUE))
+  c_high <- suppressWarnings(min(rng$q_high, na.rm = TRUE))
+  
+  if (!is.finite(c_low) || !is.finite(c_high) || c_low >= c_high) {
+    warning("Common support empty for ", x, "; skipping.")
+    return(list(df = df, c_low = c_low, c_high = c_high, rng = rng))
+  }
+  
+  ## the bounds are returned either way: the grid uses them even when
+  ## the data are not restricted
+  df2 <- if (restrict)
+    df %>% dplyr::filter(.data[[x]] >= c_low, .data[[x]] <= c_high) else df
+  
+  list(df = df2, c_low = c_low, c_high = c_high, rng = rng)
+}
+
+clean_text <- function(x) {
+  if (is.null(x)) return(x)
+  x <- enc2utf8(as.character(x))
+  x <- gsub("ManhiÃ§a", "Manhiça", x, fixed = TRUE)
+  x <- gsub("\u2013|\u2014|\u2212", "-", x)
+  x <- gsub("\u00A0", " ", x, fixed = TRUE)
+  x <- gsub("[[:space:]]+", " ", x)
+  x <- gsub("[[:cntrl:]]", "", x)
+  trimws(x)
+}
+
+write_csv_utf8_bom <- function(df, file) {
+  con <- file(file, open = "wb")
+  on.exit(close(con), add = TRUE)
+  writeBin(charToRaw("\ufeff"), con)
+  utils::write.csv(df, con, row.names = FALSE)
+}
+
+grav_short <- function(g) {
+  g <- as.character(g)
+  ifelse(g == "primigravidae", "Primi",
+         ifelse(g == "multigravidae", "Multi", g))
+}
+
+find_segments <- function(x, flag) {
+  flag <- as.logical(flag); flag[is.na(flag)] <- FALSE
+  if (!any(flag)) return(data.frame(start = numeric(0), end = numeric(0)))
+  r <- rle(flag); e <- cumsum(r$lengths); s <- e - r$lengths + 1; k <- which(r$values)
+  data.frame(start = x[s[k]], end = x[e[k]])
+}
+
+segments_to_string <- function(seg)
+  if (!nrow(seg)) "none" else paste(sprintf("%g-%g", seg$start, seg$end), collapse = "; ")
+
+## ============================================================
+## 1) Data preparation
+## ============================================================
+req <- c("visit","centro","gravidity","density","gestweeks","pcrpos",
+         "PfHRP2_pg.ml","PfLDH_pg.ml","pfhrp2_saturation",
+         "antibody_pregnancy","antibody_cumulative")
+miss <- setdiff(req, names(data))
+if (length(miss)) stop("Missing required columns: ", paste(miss, collapse = ", "))
+
+data_base <- data %>%
+  dplyr::filter(visit == "first ANC") %>%
+  dplyr::mutate(
+    row_id = dplyr::row_number(),
+    centro = dplyr::recode(as.character(centro), "ManhiÃ§a" = "Manhiça",
+                           .default = as.character(centro)),
+    pcrpos    = suppressWarnings(as.numeric(as.character(pcrpos))),
+    density   = suppressWarnings(as.numeric(as.character(density))),
+    gestweeks = suppressWarnings(as.numeric(as.character(gestweeks))),
+    PfHRP2_pg.ml = suppressWarnings(as.numeric(PfHRP2_pg.ml)),
+    PfLDH_pg.ml  = suppressWarnings(as.numeric(PfLDH_pg.ml)),
+    
+    hrp2_sat = factor(
+      ifelse(tolower(as.character(pfhrp2_saturation)) %in% c("yes","y","true","1"),
+             "Yes", "No"), levels = c("No","Yes")),
+    
+    antibody_pregnancy  = suppressWarnings(as.numeric(antibody_pregnancy)),
+    antibody_cumulative = suppressWarnings(as.numeric(antibody_cumulative)),
+    
+    ## 999 already merged into "yes" by the recoding script
+    ## net and fumig are superseded by vector_control, built in the
+    ## data preparation script; they are kept only for the flow chart
+    net   = as.character(net),
+    fumig = as.character(fumig)
+  )
+
+## ---------- sub-LLOQ antigen predictor values ----------
+## Below the LLOQ the interpolated concentration is blank noise put
+## through the standard curve. As an outcome it would be censored;
+## as a predictor the usual treatment is substitution at LLOQ/sqrt(2).
+n_sub_h <- sum(!is.na(data_base$PfHRP2_pg.ml) & data_base$PfHRP2_pg.ml < HRP2_LLOQ_PGML)
+n_sub_l <- sum(!is.na(data_base$PfLDH_pg.ml)  & data_base$PfLDH_pg.ml  < PFLDH_LLOQ_PGML)
+
+cat("\n================ SUB-LLOQ PREDICTOR VALUES =================\n")
+cat("HRP2  below LLOQ:", n_sub_h, " | PfLDH below LLOQ:", n_sub_l, "\n")
+cat("Substitution at LLOQ/sqrt(2):", SUB_BELOW_LLOQ, "\n")
+
+if (SUB_BELOW_LLOQ) {
+  data_base <- data_base %>%
+    dplyr::mutate(
+      PfHRP2_pg.ml = ifelse(!is.na(PfHRP2_pg.ml) & PfHRP2_pg.ml < HRP2_LLOQ_PGML,
+                            HRP2_LLOQ_PGML / sqrt(2), PfHRP2_pg.ml),
+      PfLDH_pg.ml  = ifelse(!is.na(PfLDH_pg.ml) & PfLDH_pg.ml < PFLDH_LLOQ_PGML,
+                            PFLDH_LLOQ_PGML / sqrt(2), PfLDH_pg.ml)
+    )
+}
+
+data_base <- data_base %>%
+  dplyr::mutate(
+    log_density = safe_log1p(density),
+    log_pfhrp2  = safe_log1p(PfHRP2_pg.ml),
+    log_pfldh   = safe_log1p(PfLDH_pg.ml)
+  ) %>%
+  dplyr::mutate(dplyr::across(
+    dplyr::any_of(c("age_group","Season","Period","vector_control",
+                    "centro","gravidity","sede","hiv")), as.factor)) %>%
+  dplyr::mutate(
+    centro    = if ("Ilha Josina" %in% levels(centro))
+      stats::relevel(centro, ref = "Ilha Josina") else centro,
+    gravidity = if ("multigravidae" %in% levels(gravidity))
+      stats::relevel(gravidity, ref = "multigravidae") else gravidity
+  ) %>%
+  dplyr::filter(pcrpos == 1) %>%
+  dplyr::mutate(
+    c_log_density = log_density - mean(log_density, na.rm = TRUE),
+    c_log_pfhrp2  = log_pfhrp2  - mean(log_pfhrp2,  na.rm = TRUE),
+    c_log_pfldh   = log_pfldh   - mean(log_pfldh,   na.rm = TRUE)
+  )
+
+if (nrow(data_base) == 0) stop("No rows after filtering to PCR+ (pcrpos == 1).")
+
+rownames(data_base) <- as.character(data_base$row_id)
+
+cat("\n================ DATA PREP (BASE) =================\n")
+cat("Rows (PCR+):", nrow(data_base), "\n")
+cat("Centres:", paste(levels(droplevels(data_base$centro)), collapse = ", "), "\n")
+cat("Gravidity:", paste(levels(droplevels(data_base$gravidity)), collapse = ", "), "\n")
+cat("\nObservations per site and gravidity:\n")
+print(as.data.frame(data_base %>% dplyr::count(centro, gravidity)))
+
+## ---- centring constants, needed to map the grid back to raw units ----
+MU_LOG_DENS <- mean(data_base$log_density - data_base$c_log_density, na.rm = TRUE)
+MU_LOG_HRP2 <- mean(data_base$log_pfhrp2  - data_base$c_log_pfhrp2,  na.rm = TRUE)
+MU_LOG_LDH  <- mean(data_base$log_pfldh   - data_base$c_log_pfldh,   na.rm = TRUE)
+
+## ============================================================
+## 1b) Common support per predictor
+## ============================================================
+cs_den  <- apply_common_support(data_base, "c_log_density",
+                                restrict = APPLY_COMMON_SUPPORT_TO_DATA)
+cs_hrp2 <- apply_common_support(data_base, "c_log_pfhrp2",
+                                restrict = APPLY_COMMON_SUPPORT_TO_DATA)
+cs_ldh  <- apply_common_support(data_base, "c_log_pfldh",
+                                restrict = APPLY_COMMON_SUPPORT_TO_DATA)
+
+data_den  <- cs_den$df
+data_hrp2 <- if (DROP_HRP2_SATURATED) cs_hrp2$df %>% dplyr::filter(hrp2_sat == "No") else cs_hrp2$df
+data_ldh  <- cs_ldh$df
+
+cat("\n================ COMMON SUPPORT =================\n")
+cat("Applied to the DATA:", APPLY_COMMON_SUPPORT_TO_DATA,
+    " (the grid is restricted either way)\n")
+for (nm in c("den","hrp2","ldh")) {
+  cs <- get(paste0("cs_", nm))
+  d  <- get(paste0("data_", nm))
+  if (is.finite(cs$c_low))
+    cat(sprintf("  %-5s [%.4f, %.4f] | rows kept: %d\n", nm, cs$c_low, cs$c_high, nrow(d)))
+  else
+    cat(sprintf("  %-5s not applied | rows kept: %d\n", nm, nrow(d)))
+}
+
+## ============================================================
+## 2) Contrast builders
+## ============================================================
+make_methods_within_site <- function(emm_obj,
+                                     grav_var = "gravidity", centro_var = "centro",
+                                     primi_lvl = "primigravidae",
+                                     multi_lvl = "multigravidae") {
+  emm_df <- as.data.frame(emm_obj); K <- nrow(emm_df)
+  g <- as.character(emm_df[[grav_var]]); s <- as.character(emm_df[[centro_var]])
+  
+  methods <- list(); labels <- character(); idx <- 1L
+  for (st in sort(unique(s))) {
+    ip <- which(g == primi_lvl & s == st); im <- which(g == multi_lvl & s == st)
+    if (!length(ip) || !length(im)) {
+      warning("Site ", st, " lacks one gravidity group; contrast skipped."); next
+    }
+    v <- numeric(K); v[ip[1]] <- 1; v[im[1]] <- -1
+    labels[idx] <- paste0("Primi - Multi, ", st); methods[[idx]] <- v; idx <- idx + 1L
+  }
+  if (!length(methods)) stop("No within-site contrasts could be built.")
+  setNames(methods, labels)
+}
+
+make_methods_primi_vs_all_nodup <- function(emm_obj,
+                                            grav_var = "gravidity", centro_var = "centro",
+                                            primi_lvl = "primigravidae") {
+  emm_df <- as.data.frame(emm_obj); K <- nrow(emm_df)
+  key <- paste(as.character(emm_df[[grav_var]]), as.character(emm_df[[centro_var]]), sep = "||")
+  idx_map <- setNames(seq_len(K), key)
+  primi_centres <- sort(unique(as.character(
+    emm_df[[centro_var]][as.character(emm_df[[grav_var]]) == primi_lvl])))
+  
+  methods <- list(); labels <- character(); idx <- 1L
+  for (c1 in primi_centres) {
+    a_key <- paste(primi_lvl, c1, sep = "||")
+    if (!a_key %in% names(idx_map)) next
+    a_idx <- idx_map[[a_key]]
+    for (j in seq_len(K)) {
+      if (j == a_idx) next
+      g2 <- as.character(emm_df[[grav_var]][j]); c2 <- as.character(emm_df[[centro_var]][j])
+      if (g2 == primi_lvl && !(c1 < c2)) next
+      v <- numeric(K); v[a_idx] <- 1; v[j] <- -1
+      labels[idx] <- paste0("Primi ", c1, " - ", grav_short(g2), " ", c2)
+      methods[[idx]] <- v; idx <- idx + 1L
+    }
+  }
+  if (!length(methods)) stop("No contrasts built (check levels).")
+  setNames(methods, labels)
+}
+
+make_methods <- function(emm_obj) {
+  if (CONTRAST_SET == "within_site") make_methods_within_site(emm_obj)
+  else make_methods_primi_vs_all_nodup(emm_obj)
+}
+
+build_pairs_within_site <- function(mf_used,
+                                    primi_lvl = "primigravidae",
+                                    multi_lvl = "multigravidae") {
+  gd <- mf_used %>% dplyr::distinct(gravidity, centro) %>%
+    dplyr::mutate(gravidity = as.character(gravidity), centro = as.character(centro))
+  out <- list(); k <- 1L
+  for (st in sort(unique(gd$centro))) {
+    if (!any(gd$gravidity == primi_lvl & gd$centro == st)) next
+    if (!any(gd$gravidity == multi_lvl & gd$centro == st)) next
+    out[[k]] <- data.frame(g1 = primi_lvl, c1 = st, g2 = multi_lvl, c2 = st,
+                           contrast = paste0("Primi - Multi, ", st),
+                           stringsAsFactors = FALSE)
+    k <- k + 1L
+  }
+  if (!length(out)) return(data.frame())
+  dplyr::bind_rows(out) %>% dplyr::distinct(contrast, .keep_all = TRUE)
+}
+
+build_pairs_primi_vs_all <- function(mf_used, primi_lvl = "primigravidae") {
+  gd <- mf_used %>% dplyr::distinct(gravidity, centro) %>%
+    dplyr::mutate(gravidity = as.character(gravidity), centro = as.character(centro))
+  primi_centres <- sort(unique(gd$centro[gd$gravidity == primi_lvl]))
+  out <- list(); k <- 1L
+  for (c1 in primi_centres) for (i in seq_len(nrow(gd))) {
+    g2 <- gd$gravidity[i]; c2 <- gd$centro[i]
+    if (g2 == primi_lvl && c2 == c1) next
+    if (g2 == primi_lvl && !(c1 < c2)) next
+    out[[k]] <- data.frame(g1 = primi_lvl, c1 = c1, g2 = g2, c2 = c2,
+                           contrast = paste0("Primi ", c1, " - ", grav_short(g2), " ", c2),
+                           stringsAsFactors = FALSE)
+    k <- k + 1L
+  }
+  if (!length(out)) return(data.frame())
+  dplyr::bind_rows(out) %>% dplyr::distinct(contrast, .keep_all = TRUE)
+}
+
+build_pairs <- function(mf_used) {
+  if (CONTRAST_SET == "within_site") build_pairs_within_site(mf_used)
+  else build_pairs_primi_vs_all(mf_used)
+}
+
+tidy_contrasts <- function(pw_sidak, pw_raw, label) {
+  as.data.frame(summary(pw_sidak, infer = c(TRUE, TRUE))) %>%
+    dplyr::rename(p_sidak = p.value) %>%
+    dplyr::left_join(
+      as.data.frame(summary(pw_raw)) %>%
+        dplyr::select(contrast, p.value) %>% dplyr::rename(p_raw = p.value),
+      by = "contrast") %>%
+    dplyr::mutate(model = label)
+}
+
+fmt_p <- function(p, lbl) {
+  base <- ifelse(is.na(p), paste0(lbl, " p = NA"), sprintf("%s p = %.3f", lbl, p))
+  ifelse(!is.na(p) & p < 0.05, paste0("<b>", base, "</b>"), base)
+}
+
+## ============================================================
+## 3) Interaction screening, as in the antigen scripts
+##
+## The predictor x gravidity x site term is retained a priori: it is
+## the primary hypothesis and must be reported whatever its p-value.
+## HIV and gestational age enter only when supported, because they
+## are secondary objectives: they say whether the antibody-antigen
+## relationship itself shifts with those variables.
+## ============================================================
+lrt_lm <- function(reduced, full, label) {
+  a <- anova(reduced, full)
+  data.frame(
+    interaction = label,
+    df_difference = abs(diff(a$Df[1:2])),
+    F_statistic = a$F[2],
+    p_value = a$`Pr(>F)`[2],
+    significant_0.05 = !is.na(a$`Pr(>F)`[2]) & a$`Pr(>F)`[2] < 0.05,
+    stringsAsFactors = FALSE)
+}
+
+screen_interactions <- function(df, outcome_var, pred, covar_str, tag) {
+  f <- function(rhs) lm(as.formula(paste0(outcome_var, " ~ ", rhs)), data = df)
+  
+  base <- paste(pred, covar_str, sep = " + ")
+  
+  rows <- list()
+  
+  ## HIV x predictor
+  if ("hiv" %in% names(df)) {
+    r <- f(paste(base, "hiv", sep = " + "))
+    u <- f(paste(base, paste0(pred, ":hiv"), "hiv", sep = " + "))
+    rows[[length(rows) + 1]] <- lrt_lm(r, u, "HIV x predictor")
+  }
+  
+  ## gestweeks x predictor
+  if ("gestweeks" %in% names(df)) {
+    r <- f(base)
+    u <- f(paste(base, paste0(pred, ":gestweeks"), sep = " + "))
+    rows[[length(rows) + 1]] <- lrt_lm(r, u, "Gestational weeks x predictor")
+  }
+  
+  ## predictor x gravidity x site, tested against all two-way terms
+  r <- f(paste(base,
+               paste0(pred, ":gravidity"), paste0(pred, ":centro"),
+               "gravidity * centro", sep = " + "))
+  u <- f(paste(base, paste0(pred, " * gravidity * centro"), sep = " + "))
+  rows[[length(rows) + 1]] <- lrt_lm(r, u, "Predictor x gravidity x site")
+  
+  dplyr::bind_rows(rows) %>% dplyr::mutate(model = tag, .before = 1)
+}
+
+## ============================================================
+## 4) Simultaneous-band machinery
+## ============================================================
+make_newdata_fixed <- function(model, grav, cent, c_var_name, c_value) {
+  ## built from the ORIGINAL variables in the formula, not from
+  ## model.frame() names, so that ns(predictor, df) is re-evaluated
+  ## by model.matrix() using the knots stored in the terms object
+  mf <- model.frame(model)
+  tt <- delete.response(stats::terms(model))
+  required_vars <- all.vars(tt)
+  
+  if (!c_var_name %in% required_vars)
+    stop("Model formula does not contain predictor: ", c_var_name)
+  
+  nd <- as.data.frame(matrix(NA, nrow = 1, ncol = length(required_vars)),
+                      stringsAsFactors = FALSE)
+  names(nd) <- required_vars
+  
+  nd[[c_var_name]] <- c_value
+  if ("gravidity" %in% names(nd)) nd$gravidity <- grav
+  if ("centro"    %in% names(nd)) nd$centro    <- cent
+  
+  for (nm in names(nd)) {
+    if (nm %in% c(c_var_name, "gravidity", "centro")) next
+    
+    src <- if (nm %in% names(mf)) mf[[nm]]
+    else if (nm %in% names(data_base)) data_base[[nm]]
+    else stop("Cannot construct newdata: variable '", nm, "' not available.")
+    
+    nd[[nm]] <- if (is.factor(src)) names(which.max(table(src)))
+    else if (is.numeric(src) || is.integer(src)) mean(src, na.rm = TRUE)
+    else src[which(!is.na(src))[1]]
+  }
+  
+  xlev <- model$xlevels
+  if (!is.null(xlev))
+    for (nm in intersect(names(xlev), names(nd)))
+      nd[[nm]] <- factor(nd[[nm]], levels = xlev[[nm]])
+  
+  nd
+}
+
+contrast_curve_exact <- function(model, raw_grid, mu_log_raw, c_var_name,
+                                 g1, c1, g2, c2, alpha = 0.05,
+                                 nsim = NSIM_BAND, seed = SEED_BAND) {
+  
+  ## ------------------------------------------------------------
+  ## SIMULTANEOUS 95% CONFIDENCE BAND
+  ##
+  ## Coefficient vectors are drawn from N(beta_hat, V_hat); for each
+  ## draw we take the largest absolute standardized deviation over
+  ## the WHOLE curve, and the 95th percentile of those maxima is the
+  ## critical value. This controls the family-wise error rate along
+  ## the predictor axis while preserving the correlation between
+  ## neighbouring points, which a Bonferroni correction over 200
+  ## grid points would ignore. Reviewer point 5.
+  ## ------------------------------------------------------------
+  
+  u <- usable(model)
+  
+  if (is.null(u)) {
+    out <- data.frame(x_raw = raw_grid, diff = NA_real_, se = NA_real_,
+                      lower = NA_real_, upper = NA_real_,
+                      sig_pos = FALSE, sig_neg = FALSE)
+    return(list(curve = out, summary = data.frame(
+      seg_pos = NA_character_, seg_neg = NA_character_,
+      x_min_used = min(raw_grid), x_max_used = max(raw_grid),
+      n_grid = length(raw_grid), simultaneous_critical = NA_real_,
+      confidence_level = 1 - alpha, nsim = nsim,
+      note = "No usable non-aliased coefficients available.")))
+  }
+  
+  tt_noy <- delete.response(terms(model))
+  
+  Xdiff <- matrix(NA_real_, nrow = length(raw_grid), ncol = length(u$names),
+                  dimnames = list(NULL, u$names))
+  
+  for (i in seq_along(raw_grid)) {
+    ## log1p here, to match how the centred predictors were built
+    xc <- log1p(raw_grid[i]) - mu_log_raw
+    
+    nd1 <- make_newdata_fixed(model, g1, c1, c_var_name, xc)
+    nd2 <- make_newdata_fixed(model, g2, c2, c_var_name, xc)
+    
+    X1 <- tryCatch(model.matrix(tt_noy, nd1), error = function(e) NULL)
+    X2 <- tryCatch(model.matrix(tt_noy, nd2), error = function(e) NULL)
+    if (is.null(X1) || is.null(X2)) next
+    if (!all(u$names %in% colnames(X1)) || !all(u$names %in% colnames(X2))) next
+    
+    Xdiff[i, ] <- X1[, u$names, drop = FALSE] - X2[, u$names, drop = FALSE]
+  }
+  
+  valid <- apply(Xdiff, 1, function(z) all(is.finite(z)))
+  if (!any(valid)) stop("No valid design rows for the simultaneous band.")
+  
+  Xv <- Xdiff[valid, , drop = FALSE]
+  x_grid_valid <- raw_grid[valid]
+  
+  diff_hat <- as.numeric(Xv %*% u$beta)
+  se_diff  <- sqrt(pmax(0, rowSums((Xv %*% u$V) * Xv)))
+  
+  se_ok <- is.finite(se_diff) & se_diff > 0
+  if (!any(se_ok)) stop("No positive finite standard errors for the band.")
+  
+  set.seed(seed)
+  beta_sim <- MASS::mvrnorm(n = nsim, mu = u$beta, Sigma = u$V, empirical = FALSE)
+  
+  sim_diff <- beta_sim %*% t(Xv)
+  z_sim <- sweep(sweep(sim_diff, 2, diff_hat, "-"), 2, se_diff, "/")
+  z_sim <- z_sim[, se_ok, drop = FALSE]
+  
+  crit <- as.numeric(stats::quantile(apply(abs(z_sim), 1, max, na.rm = TRUE),
+                                     probs = 1 - alpha, na.rm = TRUE, names = FALSE))
+  
+  out <- data.frame(x_raw = x_grid_valid, diff = diff_hat, se = se_diff,
+                    lower = diff_hat - crit * se_diff,
+                    upper = diff_hat + crit * se_diff) %>%
+    dplyr::mutate(sig_pos = is.finite(lower) & lower > 0,
+                  sig_neg = is.finite(upper) & upper < 0)
+  
+  list(curve = out,
+       summary = data.frame(
+         seg_pos = segments_to_string(find_segments(out$x_raw, out$sig_pos)),
+         seg_neg = segments_to_string(find_segments(out$x_raw, out$sig_neg)),
+         x_min_used = min(out$x_raw), x_max_used = max(out$x_raw),
+         n_grid = nrow(out), simultaneous_critical = crit,
+         confidence_level = 1 - alpha, nsim = nsim,
+         note = "Simultaneous band from parametric MVN coefficient simulation."))
+}
+
+make_shade_boundary_labels <- function(df_one, unit_suffix) {
+  df <- df_one
+  if (!nrow(df)) return(NULL)
+  sp <- df$sig_pos; sp[is.na(sp)] <- FALSE
+  sn <- df$sig_neg; sn[is.na(sn)] <- FALSE
+  seg_pos <- find_segments(df$x_raw, sp); seg_neg <- find_segments(df$x_raw, sn)
+  
+  ymin <- min(c(df$lower, df$diff, 0), na.rm = TRUE)
+  ymax <- max(c(df$upper, df$diff, 0), na.rm = TRUE)
+  span <- if (is.finite(ymax - ymin) && (ymax - ymin) > 0) (ymax - ymin) else 1
+  step <- 0.14 * span
+  labfun <- scales::label_number(accuracy = 0.01, big.mark = ",")
+  
+  bl <- function(seg, y_base, down) {
+    if (!nrow(seg)) return(NULL)
+    dplyr::bind_rows(data.frame(x_raw = seg$start), data.frame(x_raw = seg$end)) %>%
+      dplyr::distinct(x_raw) %>% dplyr::arrange(x_raw) %>%
+      dplyr::mutate(idx = dplyr::row_number(),
+                    y = if (down) y_base - (idx - 1) * step else y_base + (idx - 1) * step,
+                    y = pmin(pmax(y, ymin + 0.03 * span), ymax - 0.03 * span),
+                    label = paste0(labfun(x_raw), "\n", unit_suffix), hjust = 0.5) %>%
+      dplyr::select(x_raw, y, label, hjust)
+  }
+  
+  out <- dplyr::bind_rows(bl(seg_pos, ymax - 0.08 * span, TRUE),
+                          bl(seg_neg, ymin + 0.08 * span, FALSE))
+  if (is.null(out) || !nrow(out)) return(NULL)
+  out %>% dplyr::mutate(contrast = df$contrast[1]) %>%
+    dplyr::select(contrast, x_raw, y, label, hjust)
+}
+
+plot_contrast_curves <- function(curves_df, labels_df, title_txt, colour_hex,
+                                 x_label, y_label_txt) {
+  if (is.null(labels_df) || !nrow(labels_df) || !("contrast" %in% names(labels_df))) {
+    vlines_df <- data.frame(contrast = character(0), x_raw = numeric(0))
+    labels_df <- data.frame(contrast = character(0), x_raw = numeric(0),
+                            y = numeric(0), label = character(0), hjust = numeric(0))
+  } else {
+    vlines_df <- labels_df %>% dplyr::distinct(contrast, x_raw)
+  }
+  
+  ggplot(curves_df, aes(x = x_raw)) +
+    geom_ribbon(aes(ymin = lower, ymax = upper), fill = colour_hex, alpha = 0.18, colour = NA) +
+    geom_ribbon(data = curves_df %>% dplyr::filter(sig_pos),
+                aes(ymin = lower, ymax = upper), fill = colour_hex, alpha = 0.30, colour = NA) +
+    geom_ribbon(data = curves_df %>% dplyr::filter(sig_neg),
+                aes(ymin = lower, ymax = upper), fill = colour_hex, alpha = 0.30, colour = NA) +
+    geom_line(aes(y = diff), colour = colour_hex, linewidth = 1.0) +
+    geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.6) +
+    geom_vline(data = vlines_df, aes(xintercept = x_raw), inherit.aes = FALSE,
+               linetype = "dotted", linewidth = 0.5, colour = "black", alpha = 0.65) +
+    geom_text(data = labels_df, aes(x = x_raw, y = y, label = label, hjust = hjust),
+              inherit.aes = FALSE, size = 4.2, vjust = 0.5, color = "black",
+              lineheight = 0.95) +
+    scale_x_log10(labels = scales::label_number(accuracy = 0.01, big.mark = ",")) +
+    labs(title = title_txt, x = x_label, y = y_label_txt) +
+    theme_classic(base_size = 14) +
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+          panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.7),
+          strip.background = element_rect(fill = "white", colour = "black", linewidth = 0.7),
+          strip.text = element_text(face = "bold", size = 13, color = "black"),
+          plot.title = element_text(face = "bold", size = 15, color = "black"),
+          axis.title = element_text(size = 14, color = "black"),
+          axis.text = element_text(size = 12, color = "black"),
+          plot.margin = margin(10, 12, 10, 10))
+}
+
+safe_ggsave <- function(filename, plot, width, height, dpi = NULL, device = NULL) {
+  args <- list(filename = filename, plot = plot, width = width, height = height)
+  if (!is.null(dpi)) args$dpi <- dpi
+  if (!is.null(device)) args$device <- device
+  ok <- tryCatch({ do.call(ggplot2::ggsave, args); TRUE },
+                 error = function(e) { message("Could not save '", filename, "': ",
+                                               conditionMessage(e)); FALSE })
+  if (ok) return(filename)
+  stem <- tools::file_path_sans_ext(filename); ext <- tools::file_ext(filename)
+  fallback <- paste0(stem, "_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".", ext)
+  ok2 <- tryCatch({ do.call(ggplot2::ggsave,
+                            modifyList(args, list(filename = fallback))); TRUE },
+                  error = function(e) FALSE)
+  if (ok2) { message("Saved fallback: ", fallback); return(fallback) }
+  NA_character_
+}
+
+run_hasta_desde <- function(model_obj, predictor_tag, c_var_name, mu_log_raw,
+                            c_low, c_high, unit_suffix, colour_hex, file_stub) {
+  
+  cat("\n======== Predictor ranges where the SIMULTANEOUS 95% band",
+      "excludes zero:", predictor_tag, "========\n")
+  
+  mf_used <- model.frame(model_obj)
+  
+  if (is.finite(c_low) && is.finite(c_high) && c_low < c_high) {
+    x_min <- pmax(exp(c_low  + mu_log_raw) - 1, 1e-8)
+    x_max <- pmax(exp(c_high + mu_log_raw) - 1, 1e-8)
+  } else {
+    xc <- suppressWarnings(as.numeric(mf_used[[c_var_name]]))
+    xc <- xc[is.finite(xc)]
+    if (length(xc) < 20) { cat("Too few finite values; skipping.\n"); return(invisible(NULL)) }
+    xr <- pmax(exp(xc + mu_log_raw) - 1, 1e-8)
+    x_min <- as.numeric(quantile(xr, .01)); x_max <- as.numeric(quantile(xr, .99))
+  }
+  
+  if (!is.finite(x_min) || !is.finite(x_max) || x_min >= x_max) {
+    cat("Invalid grid bounds; skipping.\n"); return(invisible(NULL))
+  }
+  
+  x_grid <- exp(seq(log(x_min), log(x_max), length.out = 200))
+  
+  pairs_df <- build_pairs(mf_used)
+  if (!nrow(pairs_df)) { cat("No contrasts available; skipping.\n"); return(invisible(NULL)) }
+  pairs_df$contrast <- clean_text(pairs_df$contrast)
+  
+  cat("Grid:", signif(min(x_grid), 4), "to", signif(max(x_grid), 4), "(n=200)\n")
+  cat("Contrasts:", nrow(pairs_df), " | set:", CONTRAST_SET, "\n")
+  
+  res_list <- lapply(seq_len(nrow(pairs_df)), function(ii) {
+    rr <- contrast_curve_exact(model_obj, x_grid, mu_log_raw, c_var_name,
+                               pairs_df$g1[ii], pairs_df$c1[ii],
+                               pairs_df$g2[ii], pairs_df$c2[ii])
+    list(curve   = rr$curve   %>% dplyr::mutate(contrast = pairs_df$contrast[ii]),
+         summary = rr$summary %>% dplyr::mutate(contrast = pairs_df$contrast[ii]))
+  })
+  
+  curves_all <- dplyr::bind_rows(lapply(res_list, `[[`, "curve"))
+  summ_all   <- dplyr::bind_rows(lapply(res_list, `[[`, "summary"))
+  
+  n_fin <- sum(is.finite(curves_all$diff))
+  cat("Finite contrast values:", n_fin, "of", nrow(curves_all), "\n")
+  if (n_fin == 0) { warning("All contrasts NA for ", predictor_tag); return(invisible(NULL)) }
+  
+  curves_all <- curves_all %>% dplyr::mutate(contrast = clean_text(contrast))
+  summ_all   <- summ_all %>% dplyr::mutate(contrast = clean_text(contrast),
+                                           seg_pos = clean_text(seg_pos),
+                                           seg_neg = clean_text(seg_neg))
+  
+  cf <- paste0("CURVES_", file_stub, "_", predictor_tag, "_SIMULTANEOUS95CI.csv")
+  sf <- paste0("SUMMARY_", file_stub, "_", predictor_tag, "_SIMULTANEOUS95CI.csv")
+  write_csv_utf8_bom(curves_all, cf)
+  write_csv_utf8_bom(summ_all,   sf)
+  cat("Saved:\n  -", cf, "\n  -", sf, "\n")
+  
+  labels_all <- dplyr::bind_rows(
+    lapply(split(curves_all, curves_all$contrast),
+           make_shade_boundary_labels, unit_suffix = unit_suffix))
+  
+  ## with no significant segment anywhere, bind_rows of NULLs gives a
+  ## 0 x 0 tibble and the plot code would fail on a missing column
+  if (is.null(labels_all) || !nrow(labels_all) || !("contrast" %in% names(labels_all)))
+    labels_all <- data.frame(contrast = character(0), x_raw = numeric(0),
+                             y = numeric(0), label = character(0), hjust = numeric(0))
+  
+  cat("\n---- Ranges where the simultaneous band excludes zero ----\n")
+  print(as.data.frame(summ_all %>%
+                        dplyr::select(contrast, seg_pos, seg_neg, simultaneous_critical)))
+  cat("\nsimultaneous_critical replaces 1.96 and is larger, because the\n")
+  cat("band must hold across all 200 points at once (point 5).\n")
+  
+  ## keep the figure readable: with 12 contrasts only those involving
+  ## the key centre are drawn, which is what the original script did
+  keep <- if (CONTRAST_SET == "within_site" || is.na(KEY_CENTRE))
+    rep(TRUE, nrow(curves_all)) else
+      grepl(KEY_CENTRE, curves_all$contrast, fixed = TRUE)
+  
+  if (!any(keep)) {
+    warning("No contrast matched KEY_CENTRE; plotting all of them.")
+    keep <- rep(TRUE, nrow(curves_all))
+  }
+  
+  curves_plot <- curves_all[keep, , drop = FALSE] %>%
+    dplyr::mutate(contrast = factor(contrast, levels = sort(unique(contrast))))
+  
+  cat("Contrasts plotted:", nlevels(curves_plot$contrast),
+      "of", dplyr::n_distinct(curves_all$contrast), "\n")
+  
+  labels_plot <- if (nrow(labels_all))
+    labels_all %>%
+    dplyr::filter(contrast %in% levels(curves_plot$contrast)) %>%
+    dplyr::mutate(contrast = factor(contrast,
+                                    levels = levels(curves_plot$contrast))) else NULL
+  
+  ## predictor_tag carries a "_spline" suffix in the spline pass, so
+  ## strip it before using it to pick a label. Without this, switch()
+  ## falls through to its default and every spline figure is labelled
+  ## as qPCR density whatever is actually on the x axis.
+  is_spline  <- grepl("_spline$", predictor_tag)
+  pred_clean <- sub("_spline$", "", predictor_tag)
+  
+  xlab <- switch(pred_clean,
+                 HRP2  = "HRP2 (pg/mL; log scale)",
+                 PfLDH = "PfLDH (pg/mL; log scale)",
+                 "qPCR parasite density (parasites/µL; log scale)")
+  
+  pred_label <- switch(pred_clean,
+                       HRP2  = "HRP2",
+                       PfLDH = "PfLDH",
+                       "qPCR parasite density")
+  
+  ## Name the outcome in the title. The colour already encodes it,
+  ## amber wherever VAR2CSA is the outcome and purple wherever
+  ## cumulative blood-stage IgG is, but six of these figures are
+  ## written per run and "antibody level" alone does not say which
+  ## antibody is on the y axis.
+  outcome_name <- if (grepl("pregnancy", file_stub, fixed = TRUE))
+    "VAR2CSA-specific IgG" else "Cumulative blood-stage IgG"
+  
+  n_panels <- nlevels(curves_plot$contrast)
+  ncol_f <- if (CONTRAST_SET == "within_site") 3 else if (n_panels > 8) 3 else 2
+  
+  p <- plot_contrast_curves(
+    curves_plot, labels_plot,
+    title_txt = paste0(outcome_name, " by ", pred_label,
+                       if (is_spline) " (cubic spline)" else "",
+                       if (CONTRAST_SET == "within_site")
+                         "\nPrimigravidae vs multigravidae within each site, simultaneous 95% band"
+                       else
+                         "\nPrimigravidae vs every other group, simultaneous 95% band"),
+    colour_hex = colour_hex, x_label = xlab,
+    y_label_txt = paste0("Difference in ", outcome_name, " (model scale)")) +
+    facet_wrap(~ contrast, ncol = ncol_f, scales = "free_y")
+  
+  print(p)
+  
+  w <- if (CONTRAST_SET == "within_site") 15 else if (n_panels > 8) 15 else 11
+  h <- if (CONTRAST_SET == "within_site") 5.5 else if (n_panels > 8) 13 else 10
+  safe_ggsave(paste0("HASTA_DESDE_", file_stub, "_", predictor_tag,
+                     "_SIMULTANEOUS95CI.png"), p, width = w, height = h, dpi = 700)
+  safe_ggsave(paste0("HASTA_DESDE_", file_stub, "_", predictor_tag,
+                     "_SIMULTANEOUS95CI.pdf"), p, width = w, height = h,
+              device = grDevices::cairo_pdf)
+  
+  invisible(list(curves = curves_all, summary = summ_all, labels = labels_all, plot = p))
+}
+
+## ============================================================
+## 5) Runner per outcome
+## ============================================================
+run_antibody_suite <- function(outcome_var, outcome_label, file_stub) {
+  
+  cat("\n\n============================================================\n")
+  cat("OUTCOME:", outcome_label, "(", outcome_var, ")\n")
+  cat("============================================================\n")
+  
+  covars_all <- c("Season", "Period", "gestweeks", "age_group",
+                  "vector_control", "sede", "hiv")
+  
+  ## The colour identifies the OUTCOME, not the predictor. In the
+  ## combined figure the antigen panels are the ones explained by
+  ## density, and the antibody panels are a different kind of
+  ## outcome; giving all three predictors of one antibody the same
+  ## colour is what makes that readable at a glance.
+  ## The colour identifies the OUTCOME, not the predictor: amber
+  ## wherever VAR2CSA is the outcome and purple wherever cumulative
+  ## IgG is, whichever biomarker is on the x axis.
+  out_col <- if (outcome_var == "antibody_pregnancy") ambar else morado
+  
+  specs <- list(
+    list(tag = "qPCRdensity", pred = "c_log_density", df = data_den,
+         cs = cs_den,  mu = MU_LOG_DENS, unit = "parasites/µL", col = out_col),
+    list(tag = "HRP2",        pred = "c_log_pfhrp2",  df = data_hrp2,
+         cs = cs_hrp2, mu = MU_LOG_HRP2, unit = "pg/mL",        col = out_col),
+    list(tag = "PfLDH",       pred = "c_log_pfldh",   df = data_ldh,
+         cs = cs_ldh,  mu = MU_LOG_LDH,  unit = "pg/mL",        col = out_col)
+  )
+  
+  screening <- list(); models <- list(); models_spline <- list()
+  levels_all <- list(); slopes_all <- list(); fitcmp <- list()
+  
+  for (s in specs) {
+    df <- s$df; pred <- s$pred
+    covars <- covars_all[covars_all %in% names(df)]
+    covar_str <- if (length(covars)) paste(covars, collapse = " + ") else "1"
+    
+    ## ---- screening ----
+    sc <- screen_interactions(df, outcome_var, pred, covar_str, s$tag)
+    screening[[s$tag]] <- sc
+    cat("\n---- Interaction screening:", s$tag, "----\n")
+    print(sc)
+    
+    add_hiv <- isTRUE(sc$significant_0.05[sc$interaction == "HIV x predictor"])
+    add_gw  <- isTRUE(sc$significant_0.05[sc$interaction == "Gestational weeks x predictor"])
+    
+    extra <- c(if (add_hiv) paste0(pred, " * hiv") else NULL,
+               if (add_gw)  paste0(pred, " * gestweeks") else NULL)
+    
+    ## the three-way term is always in
+    rhs_lin <- paste(c(paste0(pred, " * gravidity * centro"), extra, covar_str),
+                     collapse = " + ")
+    m_lin <- lm(as.formula(paste0(outcome_var, " ~ ", rhs_lin)), data = df)
+    
+    ## ---- spline refit of the same structure ----
+    sp <- paste0("splines::ns(", pred, ", df = ", SPLINE_DF, ")")
+    extra_sp <- c(if (add_hiv) paste0(sp, " * hiv") else NULL,
+                  if (add_gw)  paste0(sp, " * gestweeks") else NULL)
+    rhs_sp <- paste(c(paste0(sp, " * gravidity * centro"), extra_sp, covar_str),
+                    collapse = " + ")
+    m_sp <- lm(as.formula(paste0(outcome_var, " ~ ", rhs_sp)), data = df)
+    
+    models[[s$tag]] <- m_lin
+    models_spline[[s$tag]] <- m_sp
+    
+    fitcmp[[s$tag]] <- data.frame(
+      outcome = outcome_label, predictor = s$tag,
+      n = nobs(m_lin),
+      hiv_included = add_hiv, gestweeks_included = add_gw,
+      AIC_linear = AIC(m_lin), AIC_spline = AIC(m_sp),
+      dAIC = AIC(m_sp) - AIC(m_lin),
+      p_spline_vs_linear = tryCatch(anova(m_lin, m_sp)$`Pr(>F)`[2],
+                                    error = function(e) NA_real_),
+      stringsAsFactors = FALSE) %>%
+      dplyr::mutate(prefers = ifelse(dAIC < 0, "spline", "linear"))
+    
+    ## ---- levels at the centring point, and slopes ----
+    emm <- emmeans(m_lin, ~ gravidity * centro, at = setNames(list(0), pred))
+    meth <- make_methods(emm)
+    levels_all[[s$tag]] <- tidy_contrasts(
+      contrast(emm, method = meth, adjust = "sidak"),
+      contrast(emm, method = meth, adjust = "none"),
+      paste(outcome_label, "|", s$tag, "level")) %>%
+      dplyr::mutate(predictor = s$tag, outcome = outcome_label)
+    
+    tr <- emtrends(m_lin, specs = ~ gravidity * centro, var = pred)
+    meth_s <- make_methods(tr)
+    slopes_all[[s$tag]] <- tidy_contrasts(
+      contrast(tr, method = meth_s, adjust = "sidak"),
+      contrast(tr, method = meth_s, adjust = "none"),
+      paste(outcome_label, "|", s$tag, "slope")) %>%
+      dplyr::mutate(predictor = s$tag, outcome = outcome_label)
+  }
+  
+  screening_df <- dplyr::bind_rows(screening) %>%
+    dplyr::mutate(outcome = outcome_label, .before = 1)
+  fitcmp_df <- dplyr::bind_rows(fitcmp)
+  levels_df <- dplyr::bind_rows(levels_all)
+  slopes_df <- dplyr::bind_rows(slopes_all)
+  
+  ## ---- model coefficients, one row per term ----
+  ## Needed for the supplementary tables. Without this the
+  ## coefficient tables for the antibody models cannot be built.
+  coefs <- dplyr::bind_rows(lapply(names(models), function(tg) {
+    broom::tidy(models[[tg]]) %>%
+      dplyr::mutate(predictor = tg,
+                    outcome   = outcome_label,
+                    AIC       = AIC(models[[tg]]),
+                    n         = nobs(models[[tg]]))
+  }))
+  write.csv(coefs, paste0("MODEL_COEFFICIENTS_", file_stub, ".csv"),
+            row.names = FALSE)
+  
+  write.csv(screening_df, paste0("INTERACTION_SCREENING_", file_stub, ".csv"), row.names = FALSE)
+  write.csv(fitcmp_df,    paste0("LINEAR_vs_SPLINE_", file_stub, ".csv"), row.names = FALSE)
+  write.csv(levels_df,    paste0("LEVELS_contrasts_", file_stub, "_Sidak.csv"), row.names = FALSE)
+  write.csv(slopes_df,    paste0("SLOPES_contrasts_", file_stub, "_Sidak.csv"), row.names = FALSE)
+  
+  cat("\n---- Linear vs spline ----\n")
+  print(as.data.frame(fitcmp_df %>%
+                        dplyr::mutate(dplyr::across(where(is.numeric), ~ round(.x, 3)))))
+  cat("\nNegative dAIC favours the spline. A spline that fits no better\n")
+  cat("answers reviewer point 6 for this predictor.\n")
+  
+  cat("\n---- Level contrasts (", CONTRAST_SET, ") ----\n", sep = "")
+  print(as.data.frame(levels_df %>%
+                        dplyr::mutate(dplyr::across(c(estimate, lower.CL, upper.CL), ~ round(.x, 3)),
+                                      p_sidak = signif(p_sidak, 3)) %>%
+                        dplyr::select(predictor, contrast, estimate, lower.CL, upper.CL, p_raw, p_sidak)))
+  
+  ## ---- forest of slopes, HRP2 predictor ----
+  ## Produced for both antibody outcomes, so the two can be set
+  ## side by side.
+  p_forest <- NULL
+  if (TRUE) {
+    fd <- slopes_df %>% dplyr::filter(predictor == "HRP2") %>%
+      dplyr::mutate(contrast = as.character(contrast),
+                    p_label = paste0(fmt_p(p_raw, "raw"), "<br/>", fmt_p(p_sidak, "Sidak")))
+    ord <- fd %>% dplyr::arrange(estimate) %>% dplyr::pull(contrast)
+    fd <- fd %>% dplyr::mutate(contrast = factor(contrast, levels = ord))
+    ym <- max(abs(c(fd$lower.CL, fd$upper.CL)), na.rm = TRUE) * 1.20
+    fd <- fd %>% dplyr::mutate(label_y = pmin(upper.CL + 0.04 * 2 * ym, ym - 0.02 * 2 * ym))
+    
+    p_forest <- ggplot(fd, aes(x = contrast, y = estimate)) +
+      geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.5) +
+      geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), width = 0.22,
+                    linewidth = 0.85, color = ambar) +
+      geom_point(shape = 22, size = 4.3, stroke = 0.95, fill = ambar, color = "black") +
+      ggtext::geom_richtext(aes(y = label_y, label = p_label), hjust = 0, size = 3,
+                            fill = NA, label.color = NA, color = "black") +
+      coord_flip(clip = "off") +
+      scale_y_continuous(limits = c(-ym, ym)) +
+      labs(title = "VAR2CSA: HRP2 slope differences", x = NULL,
+           y = "Difference in slopes") +
+      theme_classic(base_size = 12) +
+      theme(panel.grid = element_blank(),
+            panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.9),
+            plot.title = element_text(face = "bold"),
+            plot.margin = margin(8, 46, 8, 8))
+    
+    print(p_forest)
+    safe_ggsave(paste0("FOREST_", file_stub, "_HRP2_slopes.png"),
+                p_forest, width = 13, height = 6, dpi = 700)
+  }
+  
+  ## ---- hasta/desde, VAR2CSA only ----
+  ## Run for BOTH the linear and the cubic-spline models, so the two
+  ## can be compared on the same contrasts and the same grid. If the
+  ## spline curve shows a pattern the linear one cannot, that is the
+  ## answer to reviewer point 6; if the two agree, the linear form
+  ## was adequate.
+  hasta <- NULL
+  hasta_spline <- NULL
+  
+  ## Run for BOTH antibody outcomes. Previously this was restricted
+  ## to VAR2CSA, which left cumulative blood-stage IgG without the
+  ## figure showing where along the predictor the groups differ.
+  ## That outcome is the comparison against immunity which is not
+  ## placenta-specific, and the comparison cannot be judged without
+  ## seeing it on the same axes.
+  if (TRUE) {
+    
+    cat("\n============================================================\n")
+    cat("HASTA/DESDE, LINEAR MODELS\n")
+    cat("============================================================\n")
+    
+    hasta <- lapply(specs, function(s) {
+      run_hasta_desde(models[[s$tag]], s$tag, s$pred, s$mu,
+                      s$cs$c_low, s$cs$c_high, s$unit, s$col,
+                      paste0(file_stub, "_linear"))
+    })
+    names(hasta) <- vapply(specs, function(s) s$tag, character(1))
+    
+    cat("\n============================================================\n")
+    cat("HASTA/DESDE, CUBIC-SPLINE MODELS\n")
+    cat("============================================================\n")
+    
+    hasta_spline <- lapply(specs, function(s) {
+      run_hasta_desde(models_spline[[s$tag]],
+                      paste0(s$tag, "_spline"), s$pred, s$mu,
+                      s$cs$c_low, s$cs$c_high, s$unit, s$col,
+                      paste0(file_stub, "_spline"))
+    })
+    names(hasta_spline) <- vapply(specs, function(s) s$tag, character(1))
+    
+    ## ---- do the two forms agree on where the difference is? ----
+    seg_of <- function(h, form) {
+      if (is.null(h)) return(NULL)
+      dplyr::bind_rows(lapply(names(h), function(tg) {
+        x <- h[[tg]]
+        if (is.null(x)) return(NULL)
+        x$summary %>%
+          dplyr::mutate(predictor = tg, form = form) %>%
+          dplyr::select(predictor, form, contrast, seg_pos, seg_neg,
+                        simultaneous_critical)
+      }))
+    }
+    
+    agree <- dplyr::bind_rows(seg_of(hasta, "linear"),
+                              seg_of(hasta_spline, "spline"))
+    
+    if (nrow(agree)) {
+      write.csv(agree, paste0("HASTA_DESDE_linear_vs_spline_ranges_",
+                              file_stub, ".csv"), row.names = FALSE)
+      cat("\n---- Significant ranges: linear vs spline ----\n")
+      print(as.data.frame(agree %>%
+                            tidyr::pivot_wider(id_cols = c(predictor, contrast),
+                                               names_from = form,
+                                               values_from = c(seg_pos, seg_neg)) %>%
+                            dplyr::filter(!(seg_pos_linear == "none" & seg_pos_spline == "none" &
+                                              seg_neg_linear == "none" & seg_neg_spline == "none"))))
+      cat("\nRows where the two forms disagree are the ones to look at.\n")
+      cat("If the table is empty, neither form found any range, which\n")
+      cat("is itself a clean answer to points 5 and 6.\n")
+    }
+  }
+  
+  invisible(list(models = models, models_spline = models_spline,
+                 screening = screening_df, fitcmp = fitcmp_df,
+                 levels = levels_df, slopes = slopes_df,
+                 forest = p_forest, hasta = hasta,
+                 hasta_spline = hasta_spline))
+}
+
+## ============================================================
+## 6) Run both outcomes, once per contrast set
+## ============================================================
+## A top-level for loop assigns in the global environment, which is
+## where make_methods(), build_pairs() and run_hasta_desde() look
+## CONTRAST_SET up, so each pass builds its own contrast family, its
+## own Sidak adjustment over that family, and its own hasta/desde
+## figures. set_tag_of() supplies the suffix that keeps the two passes
+## in separate files.
+
+set_tag_of <- function(cs)
+  if (cs == "within_site") "withinsite" else "primivsall"
+
+res_by_set <- list()
+
+for (cs in CONTRAST_SETS) {
+  CONTRAST_SET <- cs
+  st <- set_tag_of(cs)
+  
+  cat("\n############################################################\n")
+  cat("CONTRAST SET:", cs, "  |  file tag:", st, "\n")
+  cat("############################################################\n")
+  
+  res_by_set[[cs]] <- list(
+    preg = run_antibody_suite("antibody_pregnancy", "VAR2CSA IgG",
+                              paste0("antibody_pregnancy_", st)),
+    cum  = run_antibody_suite("antibody_cumulative",
+                              "Cumulative blood-stage IgG",
+                              paste0("antibody_cumulative_", st))
+  )
+}
+
+## The twelve-contrast pass stays reachable under the original names,
+## so anything downstream that expects them keeps working.
+res_preg <- res_by_set[[CONTRAST_SETS[1]]]$preg
+res_cum  <- res_by_set[[CONTRAST_SETS[1]]]$cum
+
+## ============================================================
+## 7) MAGNITUDE within the significant regions
+## ============================================================
+trapz <- function(x, y) {
+  ok <- is.finite(x) & is.finite(y); x <- x[ok]; y <- y[ok]
+  if (length(x) < 2) return(NA_real_)
+  o <- order(x); x <- x[o]; y <- y[o]
+  sum((y[-1] + y[-length(y)]) / 2 * diff(x))
+}
+
+add_segment_id <- function(flag) {
+  flag <- as.logical(flag); flag[is.na(flag)] <- FALSE
+  r <- rle(flag); seg <- rep(NA_integer_, length(flag))
+  e <- cumsum(r$lengths); s <- e - r$lengths + 1; k <- 0L
+  for (i in seq_along(r$values)) if (isTRUE(r$values[i])) { k <- k + 1L; seg[s[i]:e[i]] <- k }
+  seg
+}
+
+summarise_magnitude <- function(curves_df, predictor_tag) {
+  if (is.null(curves_df) || !nrow(curves_df)) return(tibble::tibble())
+  
+  df <- curves_df %>%
+    dplyr::mutate(predictor = predictor_tag, contrast = clean_text(contrast),
+                  x_raw = as.numeric(x_raw), diff = as.numeric(diff),
+                  sig_pos = as.logical(sig_pos), sig_neg = as.logical(sig_neg)) %>%
+    dplyr::filter(is.finite(x_raw), x_raw > 0) %>%
+    dplyr::arrange(contrast, x_raw)
+  if (!nrow(df)) return(tibble::tibble())
+  
+  one <- function(dsub, key, flag_col, dir) {
+    dsub <- dsub %>% dplyr::arrange(x_raw) %>%
+      dplyr::mutate(flag = as.logical(.data[[flag_col]]), log10x = log10(x_raw))
+    dsub$flag[is.na(dsub$flag)] <- FALSE
+    if (!any(dsub$flag)) return(tibble::tibble())
+    dsub <- dsub %>% dplyr::mutate(seg_id = add_segment_id(flag))
+    
+    core <- function(d) {
+      w <- max(d$log10x) - min(d$log10x)
+      tibble::tibble(n_points = nrow(d), x_min = min(d$x_raw), x_max = max(d$x_raw),
+                     log10_range = w,
+                     mean_diff = mean(d$diff), median_diff = stats::median(d$diff),
+                     avg_diff_per_log10 = if (is.finite(w) && w > 0)
+                       trapz(d$log10x, d$diff)/w else NA_real_)
+    }
+    
+    overall <- dsub %>% dplyr::filter(flag) %>% core() %>%
+      dplyr::mutate(predictor = predictor_tag, contrast = key, direction = dir,
+                    level = "overall", seg_id = NA_integer_)
+    segs <- dsub %>% dplyr::filter(!is.na(seg_id)) %>% split(.$seg_id) %>%
+      lapply(function(d) core(d) %>% dplyr::mutate(seg_id = d$seg_id[1])) %>%
+      dplyr::bind_rows()
+    if (nrow(segs)) segs <- segs %>%
+      dplyr::mutate(predictor = predictor_tag, contrast = key,
+                    direction = dir, level = "segment")
+    dplyr::bind_rows(overall, segs)
+  }
+  
+  spl <- split(df, df$contrast, drop = TRUE)
+  res <- lapply(names(spl), function(cc)
+    dplyr::bind_rows(one(spl[[cc]], cc, "sig_pos", "sig_pos"),
+                     one(spl[[cc]], cc, "sig_neg", "sig_neg"))) %>%
+    dplyr::bind_rows()
+  
+  if (!nrow(res) || !("predictor" %in% names(res))) {
+    cat("  (", predictor_tag, ": no significant interval)\n", sep = "")
+    return(tibble::tibble())
+  }
+  
+  res %>% dplyr::select(predictor, contrast, direction, level, seg_id, dplyr::everything())
+}
+
+collect_mag <- function(h, form) {
+  if (is.null(h)) return(tibble::tibble())
+  dplyr::bind_rows(lapply(names(h), function(tg) {
+    x <- h[[tg]]
+    m <- summarise_magnitude(if (!is.null(x)) x$curves else NULL, tg)
+    if (nrow(m)) m$form <- form
+    m
+  }))
+}
+
+## One magnitude table per contrast set, named for the set.
+for (cs in CONTRAST_SETS) {
+  st <- set_tag_of(cs)
+  rp <- res_by_set[[cs]]$preg
+  
+  mag_all <- dplyr::bind_rows(
+    collect_mag(rp$hasta,        "linear"),
+    collect_mag(rp$hasta_spline, "spline")
+  )
+  
+  cat("\n---- VAR2CSA magnitude, overall rows, both forms |", cs, "----\n")
+  
+  if (nrow(mag_all)) {
+    mag_all <- mag_all %>% dplyr::select(form, dplyr::everything())
+    write_csv_utf8_bom(
+      mag_all,
+      paste0("MAGNITUDE_VAR2CSA_", st, "_ALLpredictors_SIMULTANEOUS95CI.csv"))
+    print(as.data.frame(mag_all %>% dplyr::filter(level == "overall") %>%
+                          dplyr::arrange(form, predictor, contrast) %>%
+                          dplyr::mutate(dplyr::across(where(is.numeric), ~ round(.x, 3)))))
+  } else {
+    cat("No predictor range survives the simultaneous band for VAR2CSA,\n")
+    cat("in either the linear or the spline form. With multiplicity\n")
+    cat("controlled across the curve, the level and slope contrasts\n")
+    cat("above are the complete summary.\n")
+  }
+}
+
+cat("\n============================================================\n")
+cat("Contrast sets run:", paste(CONTRAST_SETS, collapse = ", "), "\n")
+cat("Common support applied to the data:", APPLY_COMMON_SUPPORT_TO_DATA, "\n")
+cat("Sub-LLOQ predictor substitution at LLOQ/sqrt(2):", SUB_BELOW_LLOQ, "\n")
+cat("Key centre kept in the figures:", KEY_CENTRE, "\n")
+cat("\nDensity-specific ranges use SIMULTANEOUS 95% bands (point 5),\n")
+cat("and are produced for BOTH the linear and the cubic-spline form,\n")
+cat("so the two can be compared on the same contrasts and grid.\n")
+cat("Interactions with HIV and gestational age were screened and\n")
+cat("retained only when supported; the three-way term is always in,\n")
+cat("as the primary hypothesis. The spline comparison answers the\n")
+cat("question about functional form (point 6).\n")
+cat("============================================================\n")
+
+## ============================================================
+## SETTINGS USED
+##
+## The two ANTIGEN scripts must report the same fitted n. If one
+## says 288 and the other 382, the common-support switch is set
+## differently in the two and the results are not comparable.
+## ============================================================
+cat("\n================ SETTINGS USED =================\n")
+cat("Script:", SCRIPT_TAG, "\n")
+cat("Common support applied to data:", APPLY_COMMON_SUPPORT_TO_DATA, "\n")
+cat("Rows in the PCR+ base:", nrow(data_base), "\n")
+cat("Output folder:", getwd(), "\n")
