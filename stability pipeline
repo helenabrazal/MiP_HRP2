@@ -1,0 +1,332 @@
+## ============================================================
+## HOW STABLE IS THE PfLDH ILHA JOSINA RESULT?
+##
+## The within-site contrast for PfLDH in Ilha Josina came out at
+## 3.64 (1.00 to 13.3), p_sidak = 0.050, with the lower bound at
+## 1.00001. That is exactly on the threshold, so before it goes in
+## a response letter it is worth knowing how much it moves.
+##
+## Three reasons for concern:
+##   - the point estimates changed a lot between the restricted and
+##     unrestricted runs (Magude 3.70 -> 1.84, Manhica 3.92 -> 1.99)
+##   - p sits on 0.05 and the interval touches 1
+##   - it is one contrast out of six
+##
+## FOUR CHECKS
+##   A  influence     drop the most influential observations
+##   B  leave-one-out drop each observation in turn, worst case
+##   C  bootstrap     resample and look at the whole distribution
+##   D  specification vary the choices that were judgement calls
+##
+## Run this AFTER 17_within_site_censored_spline.R in the same
+## session: it reuses `data`, the fitted models and the helper
+## functions from that script.
+## ============================================================
+
+if (!exists("model_pfldh_total") || !exists("data"))
+  stop("Run 17_within_site_censored_spline.R first, in this session.")
+
+pacman::p_load(dplyr, tibble, ggplot2, survival, emmeans, scales)
+
+set.seed(20261002)
+
+N_BOOT     <- 500    # 500 is enough to see the shape; 2000 to quote
+DROP_FRAC  <- 0.02   # fraction of most influential observations to drop
+
+## ============================================================
+## Helper: refit and extract the within-site contrasts
+## ============================================================
+## verbose = TRUE prints the real error instead of returning NULL.
+## Use it for the first call; the loops below keep it quiet because a
+## handful of failed refits during bootstrapping is expected.
+refit_contrasts <- function(dat, label, verbose = FALSE) {
+  
+  ## survreg records the NAME of the data argument in its call, and
+  ## model.frame() later re-evaluates that name in the parent frame.
+  ## Fitted inside a function with `data = dat`, the name `dat` does
+  ## not exist outside the function and the refit fails with
+  ## "object 'dat' not found". Assigning to a global name that the
+  ## call can actually resolve avoids the whole problem.
+  assign(".stab_dat", dat, envir = .GlobalEnv)
+  
+  go <- function() {
+    m_h <- survival::survreg(formula(model_pfhrp2_total),
+                             data = .stab_dat, dist = "gaussian")
+    m_l <- survival::survreg(formula(model_pfldh_total),
+                             data = .stab_dat, dist = "gaussian")
+    
+    one <- function(m, mk) {
+      emm <- emmeans(m, ~ gravidity * centro,
+                     at = setNames(list(c_at), "c_log_density"),
+                     data = .stab_dat)
+      meth <- make_methods_within_site(emm)
+      as.data.frame(summary(contrast(emm, method = meth, adjust = "sidak"),
+                            infer = c(TRUE, TRUE))) %>%
+        mutate(marker = mk, run = label,
+               fold = exp(estimate),
+               fold_low = exp(lower.CL), fold_high = exp(upper.CL)) %>%
+        select(run, marker, contrast, estimate, fold, fold_low, fold_high, p.value)
+    }
+    
+    bind_rows(one(m_h, "HRP2"), one(m_l, "PfLDH"))
+  }
+  
+  if (verbose) return(go())
+  
+  tryCatch(go(), error = function(e) NULL)
+}
+
+base_res <- refit_contrasts(data, "full data", verbose = TRUE)
+
+if (is.null(base_res) || !nrow(base_res))
+  stop("The baseline refit produced nothing. Fix that before going on.")
+
+cat("================ BASELINE ================\n")
+print(as.data.frame(base_res %>%
+                      mutate(across(c(fold, fold_low, fold_high), ~ round(.x, 2)),
+                             p.value = signif(p.value, 3))))
+
+TARGET <- "Primi - Multi, Ilha Josina"
+base_ldh <- base_res %>% filter(marker == "PfLDH", contrast == TARGET)
+cat("\nThe contrast under scrutiny: PfLDH,", TARGET, "\n")
+cat("  fold =", round(base_ldh$fold, 3),
+    " 95% CI", round(base_ldh$fold_low, 3), "to", round(base_ldh$fold_high, 3),
+    " p =", signif(base_ldh$p.value, 3), "\n")
+
+## ============================================================
+## A) INFLUENCE
+##    survreg has no cooks.distance method, so influence is measured
+##    directly: refit without each observation and record how far the
+##    target contrast moves. That is the quantity we actually care
+##    about, rather than a generic leverage statistic.
+## ============================================================
+cat("\n================ A) INFLUENCE ================\n")
+cat("Refitting", nrow(data), "times, one observation left out each time.\n")
+cat("This takes a minute.\n")
+
+loo <- vapply(seq_len(nrow(data)), function(i) {
+  r <- refit_contrasts(data[-i, , drop = FALSE], "loo")
+  if (is.null(r)) return(NA_real_)
+  v <- r$estimate[r$marker == "PfLDH" & r$contrast == TARGET]
+  if (!length(v)) NA_real_ else v
+}, numeric(1))
+
+delta <- loo - base_ldh$estimate
+names(delta) <- rownames(data)
+
+infl <- tibble(
+  row = seq_len(nrow(data)),
+  estimate_without = loo,
+  change = delta,
+  fold_without = exp(loo)
+) %>% arrange(desc(abs(change)))
+
+cat("\nTen most influential observations:\n")
+print(as.data.frame(infl %>% slice_head(n = 10) %>%
+                      mutate(across(c(estimate_without, change, fold_without), ~ round(.x, 3)))))
+
+k <- max(1, ceiling(DROP_FRAC * nrow(data)))
+drop_rows <- infl$row[seq_len(k)]
+
+cat("\nDropping the", k, "most influential observations (", DROP_FRAC * 100, "%):\n")
+res_drop <- refit_contrasts(data[-drop_rows, , drop = FALSE],
+                            paste0("minus ", k, " influential"))
+print(as.data.frame(res_drop %>% filter(marker == "PfLDH") %>%
+                      mutate(across(c(fold, fold_low, fold_high), ~ round(.x, 2)),
+                             p.value = signif(p.value, 3))))
+
+cat("\nSingle-observation worst case for the target contrast:\n")
+cat("  fold ranges from", round(min(exp(loo), na.rm = TRUE), 2),
+    "to", round(max(exp(loo), na.rm = TRUE), 2),
+    "when any one woman is removed.\n")
+cat("\nIf removing ONE woman moves the fold-difference substantially,\n")
+cat("the estimate is not safe to report as a firm finding.\n")
+
+write.csv(infl, "STABILITY_influence_leave_one_out.csv", row.names = FALSE)
+
+## ============================================================
+## B) LEAVE ONE SITE OUT
+##    does the Ilha Josina contrast depend on the other two sites
+##    being in the model at all?
+## ============================================================
+cat("\n================ B) LEAVE ONE SITE OUT ================\n")
+
+site_res <- bind_rows(lapply(levels(droplevels(data$centro)), function(st) {
+  d2 <- data %>% filter(centro != st) %>% droplevels()
+  if (n_distinct(d2$centro) < 2) return(NULL)
+  r <- refit_contrasts(d2, paste("without", st))
+  if (is.null(r)) return(NULL)
+  r %>% filter(marker == "PfLDH")
+}))
+
+if (nrow(site_res)) {
+  print(as.data.frame(site_res %>%
+                        mutate(across(c(fold, fold_low, fold_high), ~ round(.x, 2)),
+                               p.value = signif(p.value, 3))))
+  cat("\nThe Ilha Josina contrast should barely move when another site\n")
+  cat("is removed. If it does move, the sites are sharing information\n")
+  cat("through the covariates more than they should.\n")
+}
+
+## ============================================================
+## C) BOOTSTRAP
+##    resample women with replacement, stratified by site and
+##    gravidity so every cell keeps its size
+## ============================================================
+cat("\n================ C) BOOTSTRAP ================\n")
+cat("Resampling", N_BOOT, "times, stratified by site and gravidity.\n")
+
+strata <- interaction(data$centro, data$gravidity, drop = TRUE)
+idx_by_stratum <- split(seq_len(nrow(data)), strata)
+
+boot <- vapply(seq_len(N_BOOT), function(b) {
+  idx <- unlist(lapply(idx_by_stratum, function(ix) sample(ix, length(ix), replace = TRUE)))
+  r <- refit_contrasts(data[idx, , drop = FALSE], "boot")
+  if (is.null(r)) return(NA_real_)
+  v <- r$estimate[r$marker == "PfLDH" & r$contrast == TARGET]
+  if (!length(v)) NA_real_ else v
+}, numeric(1))
+
+ok <- is.finite(boot)
+cat("Successful refits:", sum(ok), "of", N_BOOT, "\n")
+
+if (sum(ok) >= 100) {
+  q <- quantile(boot[ok], c(.025, .25, .5, .75, .975))
+  cat("\nBootstrap distribution of the fold-difference:\n")
+  print(round(exp(q), 2))
+  cat("\nProportion of resamples with fold > 1:",
+      round(mean(boot[ok] > 0), 3), "\n")
+  cat("Proportion with fold > 2:", round(mean(boot[ok] > log(2)), 3), "\n")
+  
+  cat("\nThe percentile interval is", round(exp(q[1]), 2), "to", round(exp(q[5]), 2),
+      "\nagainst the model-based", round(base_ldh$fold_low, 2), "to",
+      round(base_ldh$fold_high, 2), "\n")
+  cat("A much wider bootstrap interval means the model-based one is\n")
+  cat("optimistic, which matters when p is sitting on 0.05.\n")
+  
+  p_boot <- ggplot(tibble(fold = exp(boot[ok])), aes(fold)) +
+    geom_histogram(bins = 40, fill = "#1f78b4", colour = "white", linewidth = 0.2) +
+    geom_vline(xintercept = 1, linetype = "dashed") +
+    geom_vline(xintercept = base_ldh$fold, colour = "#800020", linewidth = 1) +
+    scale_x_log10(labels = label_number(accuracy = 0.1)) +
+    labs(title = paste0("Bootstrap distribution: PfLDH, ", TARGET),
+         subtitle = paste0(sum(ok), " resamples; red line is the fitted estimate, ",
+                           "dashed line is no difference"),
+         x = "fold-difference (log scale)", y = "resamples") +
+    theme_classic(base_size = 12) +
+    theme(panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+          plot.title = element_text(face = "bold"))
+  
+  print(p_boot)
+  ggsave("STABILITY_bootstrap_PfLDH_IlhaJosina.png", p_boot,
+         width = 8, height = 5, dpi = 300)
+  
+  write.csv(tibble(replicate = which(ok), estimate = boot[ok], fold = exp(boot[ok])),
+            "STABILITY_bootstrap_draws.csv", row.names = FALSE)
+} else {
+  cat("Too few successful refits to summarise. The model is probably\n")
+  cat("too complex for resampled datasets of this size, which is\n")
+  cat("itself a sign of fragility.\n")
+}
+
+## ============================================================
+## D) SPECIFICATION SENSITIVITY
+##    the choices that were judgement calls, varied one at a time
+## ============================================================
+cat("\n================ D) SPECIFICATION ================\n")
+
+spec <- list()
+
+## D1: a simpler model, group main effects without the triple
+rhs_simple <- paste("c_log_density", "gravidity * centro", covar_str, sep = " + ")
+m_l_simple <- tryCatch(
+  survival::survreg(
+    as.formula(paste0("survival::Surv(ldh_t1, ldh_t2, type = 'interval2') ~ ", rhs_simple)),
+    data = data, dist = "gaussian"),
+  error = function(e) NULL)
+
+if (!is.null(m_l_simple)) {
+  emm <- emmeans(m_l_simple, ~ gravidity * centro,
+                 at = setNames(list(c_at), "c_log_density"), data = data)
+  r <- as.data.frame(summary(
+    contrast(emm, method = make_methods_within_site(emm), adjust = "sidak"),
+    infer = c(TRUE, TRUE)))
+  spec[[length(spec) + 1]] <- r %>%
+    mutate(run = "no triple interaction", marker = "PfLDH",
+           fold = exp(estimate), fold_low = exp(lower.CL), fold_high = exp(upper.CL)) %>%
+    select(run, marker, contrast, fold, fold_low, fold_high, p.value)
+}
+
+## D2: the LLOQ moved by a factor of two in each direction
+for (mult in c(0.5, 2)) {
+  d2 <- data
+  new_lloq <- PFLDH_LLOQ_PGML * mult
+  LL <- make_interval(d2$PfLDH_pg.ml, !is.na(d2$pfldh_detection), d2$ldh_sat,
+                      d2$pfldh_detection, new_lloq, NA_real_)
+  d2$ldh_t1 <- LL$t1; d2$ldh_t2 <- LL$t2
+  
+  m <- tryCatch(survival::survreg(formula(model_pfldh_total), data = d2, dist = "gaussian"),
+                error = function(e) NULL)
+  if (is.null(m)) next
+  
+  emm <- emmeans(m, ~ gravidity * centro,
+                 at = setNames(list(c_at), "c_log_density"), data = d2)
+  r <- as.data.frame(summary(
+    contrast(emm, method = make_methods_within_site(emm), adjust = "sidak"),
+    infer = c(TRUE, TRUE)))
+  spec[[length(spec) + 1]] <- r %>%
+    mutate(run = paste0("LLOQ x ", mult), marker = "PfLDH",
+           fold = exp(estimate), fold_low = exp(lower.CL), fold_high = exp(upper.CL)) %>%
+    select(run, marker, contrast, fold, fold_low, fold_high, p.value)
+}
+
+## D3: evaluated at the median density instead of the mean
+c_median <- median(data$c_log_density, na.rm = TRUE)
+emm <- emmeans(model_pfldh_total, ~ gravidity * centro,
+               at = setNames(list(c_median), "c_log_density"), data = data)
+r <- as.data.frame(summary(
+  contrast(emm, method = make_methods_within_site(emm), adjust = "sidak"),
+  infer = c(TRUE, TRUE)))
+spec[[length(spec) + 1]] <- r %>%
+  mutate(run = sprintf("at median density (%.1f p/uL)", exp(c_median + MU_LOG_DENSITY)),
+         marker = "PfLDH",
+         fold = exp(estimate), fold_low = exp(lower.CL), fold_high = exp(upper.CL)) %>%
+  select(run, marker, contrast, fold, fold_low, fold_high, p.value)
+
+spec_all <- bind_rows(
+  base_res %>% filter(marker == "PfLDH") %>%
+    select(run, marker, contrast, fold, fold_low, fold_high, p.value = p.value),
+  bind_rows(spec)
+)
+
+cat("\nThe target contrast under each specification:\n")
+print(as.data.frame(spec_all %>%
+                      filter(contrast == TARGET) %>%
+                      mutate(across(c(fold, fold_low, fold_high), ~ round(.x, 2)),
+                             p.value = signif(p.value, 3))))
+
+write.csv(spec_all, "STABILITY_specification.csv", row.names = FALSE)
+
+## tidy up the temporary global used for refitting
+if (exists(".stab_dat", envir = .GlobalEnv))
+  rm(".stab_dat", envir = .GlobalEnv)
+
+## ============================================================
+## VERDICT
+## ============================================================
+cat("\n============================================================\n")
+cat("HOW TO READ THIS\n\n")
+cat("The result is reportable as a finding if:\n")
+cat("  - dropping the", k, "most influential women leaves the fold\n")
+cat("    difference in the same ballpark and still above 1\n")
+cat("  - no single woman moves it by much\n")
+cat("  - the bootstrap interval is not far wider than the model one,\n")
+cat("    and most resamples are above 1\n")
+cat("  - the specification table does not swing it across 1\n\n")
+cat("If it fails any of those, report it as suggestive rather than\n")
+cat("significant: a consistent direction across sites, with the\n")
+cat("strongest signal in the highest-transmission site and in the\n")
+cat("shorter-lived antigen, but intervals too wide to be conclusive.\n")
+cat("That is still a defensible paper, and it is honest about a\n")
+cat("p-value sitting on 0.05 with a lower bound of 1.00001.\n")
+cat("============================================================\n")
