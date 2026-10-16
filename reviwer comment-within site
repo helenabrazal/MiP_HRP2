@@ -1,0 +1,1798 @@
+## ============================================================
+## SCRIPT 1 — Antigens as outcomes (SENSITIVITY) — LEFT-CENSORED
+## WITHIN-SITE GRAVIDITY CONTRASTS
+##
+## Identical to the automated-screening script. The ONLY change is
+## which contrasts are estimated:
+##
+##   before: Primi anchored against every other group, 12 contrasts
+##           per marker, mixing within-site and cross-site comparisons
+##
+##   now:    primigravidae vs multigravidae WITHIN each site,
+##           3 contrasts per marker
+##
+## WHY (reviewer point 7)
+##   Site and gravidity are confounded, so a cross-site contrast
+##   mixes the gravidity effect with everything else that differs
+##   between sites. Comparing primigravidae with multigravidae inside
+##   the same site holds all of that constant.
+##
+##   It also costs far less multiplicity: Sidak across 3 contrasts
+##   uses a threshold of about 0.017; across 12 it was about 0.0043.
+##
+## EVERYTHING ELSE IS UNCHANGED
+##   - values below the LLOQ are LEFT-CENSORED, not dropped and not
+##     set to zero (reviewer points 2 and 3)
+##   - all qPCR-positive infections enter, no detectability filter
+##   - automated LRT screening of HIV x density and gestweeks x
+##     density; the three-way density x gravidity x site term is
+##     retained a priori because it is the primary hypothesis
+##   - cubic-spline refit of the selected structure (point 6)
+##   - SIMULTANEOUS 95% confidence bands across the density curve
+##     (point 5)
+##
+## THREE FIXES relative to the version this came from
+##   1) nobs() replaced by nrow(model.frame()); survreg has no nobs
+##      method and the default returns the wrong number
+##   2) MASS loaded by namespace only; attaching it would mask
+##      dplyr::select and break every select() downstream
+##   3) net / fumig left as they arrive from the recoding script,
+##      where 999 was already merged into "yes"
+## ============================================================
+
+## ---------- Setup ----------
+
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+pacman::p_load(
+  dplyr, readr, tidyr, tibble,
+  ggplot2, ggtext, patchwork,
+  broom, emmeans, car, scales,
+  survival, grid, png, splines
+)
+
+## MASS is used only as MASS::mvrnorm() for the simultaneous band.
+## Do NOT attach it: MASS exports select(), which masks dplyr::select
+## and makes every select() call fail with "unused arguments".
+if (!requireNamespace("MASS", quietly = TRUE)) install.packages("MASS")
+
+burgundy <- "#800020"
+blue     <- "#1f78b4"
+
+## ---------- Read data ----------
+## ============================================================
+## OUTPUT FOLDER
+##
+## The data are read by ABSOLUTE path and the working directory is
+## then moved to the output folder, so every write.csv, ggsave,
+## saveRDS, write_csv_utf8_bom and PNG read-back lands there without
+## touching a single output filename. Running the three scripts on
+## the same day fills one folder.
+## ============================================================
+PROJECT_DIR <- "C:/HRP2 analysis/MiP_HRP2_manuscriptcodes/MiP_HRP2"
+RUN_TAG     <- format(Sys.Date(), "%Y%m%d")
+OUTDIR      <- file.path(PROJECT_DIR, "resultados", RUN_TAG)
+SCRIPT_TAG  <- "antigen_within_site"
+
+dir.create(OUTDIR, recursive = TRUE, showWarnings = FALSE)
+
+data <- read.csv(file.path(PROJECT_DIR, "ANC_recoded.csv"),
+                 stringsAsFactors = FALSE, check.names = FALSE)
+
+setwd(OUTDIR)
+
+cat("\n================ OUTPUT =================\n")
+cat("Script    :", SCRIPT_TAG, "\n")
+cat("Project   :", PROJECT_DIR, "\n")
+cat("Writing   :", OUTDIR, "\n")
+cat("Input rows:", nrow(data), "\n")
+
+writeLines(
+  c(paste("script:", SCRIPT_TAG),
+    paste("run:", format(Sys.time())),
+    paste("R:", R.version.string),
+    paste("input:", file.path(PROJECT_DIR, "ANC_recoded.csv"))),
+  con = paste0("RUNLOG_", SCRIPT_TAG, "_",
+               format(Sys.time(), "%H%M%S"), ".txt")
+)
+
+## ============================================================
+## Assay limits in pg/mL
+## ============================================================
+HRP2_SAT_PGML <- 5829.7016
+
+HRP2_LLOQ_PGML  <- 0.0034846
+PFLDH_LLOQ_PGML <- 0.034846
+
+## Restricting the DATA to the common support costs 106 of 394
+## infections, and because the lower bound is set by the smallest
+## group it throws out most of the low-density infections that
+## reviewer point 2 asks to include. FALSE fits on everything and
+## restricts only the prediction grid, which is all that is needed
+## to avoid extrapolation. TRUE reproduces the earlier behaviour.
+APPLY_COMMON_SUPPORT_TO_DATA <- FALSE
+
+## ============================================================
+## 0) Robust model helpers
+## ============================================================
+usable <- function(model) {
+  if (is.null(model)) return(NULL)
+  
+  beta <- tryCatch(stats::coef(model), error = function(e) NULL)
+  V <- tryCatch(stats::vcov(model), error = function(e) NULL)
+  
+  if (is.null(beta) || is.null(V) || length(beta) == 0) return(NULL)
+  
+  keep <- is.finite(beta) & names(beta) %in% rownames(V)
+  if (!any(keep)) return(NULL)
+  
+  nm <- names(beta)[keep]
+  beta2 <- beta[keep]
+  V2 <- V[nm, nm, drop = FALSE]
+  
+  if (any(!is.finite(beta2)) || any(!is.finite(V2))) {
+    keep2 <- is.finite(beta2) & vapply(
+      seq_along(beta2),
+      function(i) all(is.finite(V2[i, ])) && all(is.finite(V2[, i])),
+      logical(1)
+    )
+    if (!any(keep2)) return(NULL)
+    nm <- nm[keep2]
+    beta2 <- beta2[keep2]
+    V2 <- V2[nm, nm, drop = FALSE]
+  }
+  
+  list(beta = beta2, V = V2, names = nm)
+}
+
+## survreg has no nobs() method
+n_obs <- function(fit) nrow(model.frame(fit))
+
+## ============================================================
+## 0B) Helper: common support filter
+## ============================================================
+apply_common_support <- function(df,
+                                 x = "c_log_density",
+                                 group_vars = c("gravidity", "centro"),
+                                 probs = c(0.05, 0.95),
+                                 restrict = TRUE) {
+  stopifnot(x %in% names(df))
+  stopifnot(all(group_vars %in% names(df)))
+  
+  rng <- df %>%
+    dplyr::filter(is.finite(.data[[x]]), !is.na(.data[[x]])) %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(group_vars))) %>%
+    dplyr::summarise(
+      q_low  = as.numeric(stats::quantile(.data[[x]], probs[1], na.rm = TRUE)),
+      q_high = as.numeric(stats::quantile(.data[[x]], probs[2], na.rm = TRUE)),
+      n_grp  = dplyr::n(),
+      .groups = "drop"
+    )
+  
+  if (nrow(rng) < 2) {
+    warning("Common support: <2 groups; skipping restriction.")
+    return(list(df = df, c_low = NA_real_, c_high = NA_real_, rng = rng))
+  }
+  
+  c_low  <- max(rng$q_low,  na.rm = TRUE)
+  c_high <- min(rng$q_high, na.rm = TRUE)
+  
+  if (!is.finite(c_low) || !is.finite(c_high) || c_low >= c_high) {
+    warning("Common support empty; skipping restriction.")
+    return(list(df = df, c_low = c_low, c_high = c_high, rng = rng))
+  }
+  
+  ## the bounds are always returned: the prediction grid uses them
+  ## whether or not the data themselves are restricted
+  df2 <- if (restrict)
+    df %>% dplyr::filter(.data[[x]] >= c_low, .data[[x]] <= c_high) else df
+  
+  list(df = df2, c_low = c_low, c_high = c_high, rng = rng)
+}
+
+## ============================================================
+## 1) Data preparation
+## ============================================================
+data <- data %>%
+  dplyr::filter(visit == "first ANC") %>%
+  dplyr::mutate(
+    centro = as.character(centro),
+    centro = dplyr::recode(centro, "ManhiÃ§a" = "Manhiça", .default = centro),
+    
+    pcrpos = suppressWarnings(as.numeric(as.character(pcrpos))),
+    
+    PfHRP2_pg.ml = suppressWarnings(as.numeric(PfHRP2_pg.ml)),
+    PfLDH_pg.ml  = suppressWarnings(as.numeric(PfLDH_pg.ml)),
+    density      = suppressWarnings(as.numeric(density)),
+    
+    hrp2_sat = tolower(as.character(pfhrp2_saturation)) %in% c("yes","y","true","1"),
+    ldh_sat  = tolower(as.character(pfldh_saturation))  %in% c("yes","y","true","1"),
+    
+    gestweeks = suppressWarnings(as.numeric(as.character(gestweeks))),
+    age       = suppressWarnings(as.numeric(as.character(age))),
+    
+    ## 999 was already merged into "yes" by the recoding script
+    net   = as.character(net),
+    fumig = as.character(fumig)
+  ) %>%
+  dplyr::mutate(
+    dplyr::across(
+      dplyr::any_of(c("age_group","Season","Period","net","fumig",
+                      "centro","gravidity","sede","hiv")),
+      as.factor
+    )
+  ) %>%
+  dplyr::filter(pcrpos == 1) %>%
+  dplyr::filter(!is.na(density), is.finite(density), density > 0) %>%
+  dplyr::mutate(log_density = log(density))
+
+if (!("gestweeks" %in% names(data))) stop("gestweeks column is missing.")
+if (all(is.na(data$gestweeks)))      stop("gestweeks is all NA after recoding.")
+if (nrow(data) == 0)                 stop("No rows after filtering to PCR+ with density > 0.")
+
+cat("\n================ ASSAY LIMITS =================\n")
+cat("HRP2  LLOQ:", HRP2_LLOQ_PGML, " | saturation:", HRP2_SAT_PGML, "pg/mL\n")
+cat("PfLDH LLOQ:", PFLDH_LLOQ_PGML, "pg/mL\n")
+
+## ============================================================
+## 1b) BUILD THE CENSORED OUTCOMES
+##
+## A concentration is unusable for one of two reasons, and they are
+## not the same thing:
+##   below the LLOQ  -> informative, the value lies in (0, LLOQ)
+##   never assayed   -> no information, the row must be dropped
+## The detection column tells them apart: it is non-missing for any
+## well that produced a reading.
+## ============================================================
+make_interval <- function(conc, assayed, saturated, detection, lloq, uloq = NA_real_) {
+  n  <- length(conc)
+  t1 <- rep(NA_real_, n)
+  t2 <- rep(NA_real_, n)
+  
+  detection <- tolower(trimws(as.character(detection)))
+  
+  ## Left-censor anything known to be below the LLOQ. Non-detected
+  ## samples are below the LLOD and therefore necessarily below the
+  ## LLOQ; numerical sub-LLOQ concentrations are censored too, since
+  ## below that limit the interpolated value is blank noise pushed
+  ## through the standard curve.
+  below <- assayed & !saturated & (
+    detection == "non detected" |
+      (!is.na(conc) & is.finite(conc) & conc < lloq)
+  )
+  ## an exact observation needs a usable value, so a stray NA can
+  ## never be read as a measurement
+  quantified <- assayed & !saturated & !below & !is.na(conc) & is.finite(conc)
+  above      <- assayed & saturated
+  
+  t1[quantified] <- log1p(conc[quantified])
+  t2[quantified] <- log1p(conc[quantified])
+  
+  t1[below] <- NA_real_
+  t2[below] <- log1p(lloq)
+  
+  if (is.finite(uloq)) {
+    t1[above] <- log1p(uloq)
+    t2[above] <- NA_real_
+  }
+  
+  status <- dplyr::case_when(
+    !assayed   ~ "not_assayed",
+    below      ~ "left_censored",
+    above      ~ "right_censored",
+    quantified ~ "exact",
+    TRUE       ~ "unusable"
+  )
+  
+  list(t1 = t1, t2 = t2, status = status)
+}
+
+h_assayed <- !is.na(data$pfhrp2_detection)
+l_assayed <- !is.na(data$pfldh_detection)
+
+H <- make_interval(data$PfHRP2_pg.ml, h_assayed, data$hrp2_sat,
+                   data$pfhrp2_detection, HRP2_LLOQ_PGML, HRP2_SAT_PGML)
+L <- make_interval(data$PfLDH_pg.ml, l_assayed, data$ldh_sat,
+                   data$pfldh_detection, PFLDH_LLOQ_PGML, NA_real_)
+
+data$hrp2_t1 <- H$t1; data$hrp2_t2 <- H$t2; data$hrp2_status <- H$status
+data$ldh_t1  <- L$t1; data$ldh_t2  <- L$t2; data$ldh_status  <- L$status
+
+cat("\n================ CENSORING =================\n")
+cat("HRP2 LLOQ used for left censoring:", HRP2_LLOQ_PGML, "pg/mL\n")
+cat("PfLDH LLOQ used for left censoring:", PFLDH_LLOQ_PGML, "pg/mL\n")
+cat("HRP2 :\n");  print(table(data$hrp2_status, useNA = "ifany"))
+cat("PfLDH:\n");  print(table(data$ldh_status,  useNA = "ifany"))
+cat("\nleft_censored rows were previously DROPPED. They are now in the\n")
+cat("model as 'somewhere below the LLOQ' (reviewer points 2 and 3).\n")
+
+MU_LOG_DENSITY <- mean(data$log_density, na.rm = TRUE)
+
+data <- data %>%
+  dplyr::mutate(c_log_density = log_density - MU_LOG_DENSITY) %>%
+  dplyr::mutate(
+    centro    = if ("Ilha Josina" %in% levels(centro))
+      stats::relevel(centro, ref = "Ilha Josina") else centro,
+    gravidity = if ("multigravidae" %in% levels(gravidity))
+      stats::relevel(gravidity, ref = "multigravidae") else gravidity
+  )
+
+cs <- apply_common_support(
+  data,
+  x = "c_log_density",
+  group_vars = c("gravidity","centro"),
+  probs = c(0.05, 0.95),
+  restrict = APPLY_COMMON_SUPPORT_TO_DATA
+)
+
+data <- cs$df
+COMMON_C_LOW  <- cs$c_low
+COMMON_C_HIGH <- cs$c_high
+
+cat("\n================ DATA PREP =================\n")
+cat("Rows for fitting:", nrow(data),
+    "| common support applied to data:", APPLY_COMMON_SUPPORT_TO_DATA, "\n")
+cat("Centres:", paste(levels(droplevels(data$centro)), collapse = ", "), "\n")
+cat("Gravidity:", paste(levels(droplevels(data$gravidity)), collapse = ", "), "\n")
+cat(sprintf("Mean log(density) used for centering: %.6f\n", MU_LOG_DENSITY))
+if (is.finite(COMMON_C_LOW) && is.finite(COMMON_C_HIGH) && COMMON_C_LOW < COMMON_C_HIGH) {
+  cat(sprintf("Common support: [%.4f, %.4f] = [%.3f, %.1f] parasites/uL\n",
+              COMMON_C_LOW, COMMON_C_HIGH,
+              exp(COMMON_C_LOW + MU_LOG_DENSITY), exp(COMMON_C_HIGH + MU_LOG_DENSITY)))
+} else {
+  cat("Common support: not applied (empty/invalid)\n")
+}
+
+cat("\nObservations per site and gravidity:\n")
+print(as.data.frame(data %>% dplyr::count(centro, gravidity)))
+cat("\nThese are the cells the within-site contrasts compare.\n")
+
+## ============================================================
+## 2) AUTOMATED INTERACTION SCREENING + JOINT MODELS
+##
+## For EACH outcome, three interaction hypotheses are screened
+## separately by likelihood-ratio test:
+##
+##   A) HIV x PCR density
+##   B) gestational weeks x PCR density
+##   C) centro x gravidity x PCR density
+##
+## The centro x gravidity x PCR interaction is ALWAYS retained: it
+## is the primary hypothesis and has to be reported whatever its
+## p-value. Say so in Methods, otherwise it looks as though two
+## interactions were selected on significance and one was not.
+##
+## HIV x PCR and gestweeks x PCR are added only when their screening
+## LRT is significant. They are secondary objectives: they tell you
+## whether the antigen-density relationship itself shifts with
+## gestational age or HIV status, which is why they belong in the
+## model when supported.
+## ============================================================
+covars <- c("age_group", "Season", "Period", "gestweeks",
+            "net", "fumig", "sede", "hiv")
+covars <- covars[covars %in% names(data)]
+covar_str <- if (length(covars)) paste(covars, collapse = " + ") else "1"
+
+SPLINE_DF <- 3
+
+lrt_survreg <- function(reduced, full, label) {
+  ll_reduced <- as.numeric(logLik(reduced))
+  ll_full    <- as.numeric(logLik(full))
+  df_reduced <- attr(logLik(reduced), "df")
+  df_full    <- attr(logLik(full), "df")
+  
+  df_diff <- df_full - df_reduced
+  lr_stat <- 2 * (ll_full - ll_reduced)
+  p_value <- stats::pchisq(lr_stat, df = df_diff, lower.tail = FALSE)
+  
+  data.frame(
+    interaction = label,
+    logLik_reduced = ll_reduced,
+    logLik_full = ll_full,
+    df_difference = df_diff,
+    LR_statistic = lr_stat,
+    p_value = p_value,
+    significant_0.05 = !is.na(p_value) & p_value < 0.05,
+    stringsAsFactors = FALSE
+  )
+}
+
+make_screen_formula <- function(outcome_t1, outcome_t2, interaction_term, covar_string) {
+  rhs <- paste0(interaction_term, " + ", covar_string)
+  stats::as.formula(
+    paste0("survival::Surv(", outcome_t1, ", ", outcome_t2,
+           ", type = 'interval2') ~ ", rhs)
+  )
+}
+
+## ============================================================
+## 2A) HRP2 screening
+## ============================================================
+hrp2_f_reduced_hiv <- make_screen_formula("hrp2_t1", "hrp2_t2", "c_log_density + hiv", covar_str)
+hrp2_f_full_hiv    <- make_screen_formula("hrp2_t1", "hrp2_t2", "c_log_density * hiv", covar_str)
+
+hrp2_f_reduced_gw <- make_screen_formula("hrp2_t1", "hrp2_t2", "c_log_density + gestweeks", covar_str)
+hrp2_f_full_gw    <- make_screen_formula("hrp2_t1", "hrp2_t2", "c_log_density * gestweeks", covar_str)
+
+hrp2_f_reduced_cg <- make_screen_formula(
+  "hrp2_t1", "hrp2_t2",
+  "c_log_density * gravidity + c_log_density * centro + gravidity * centro",
+  covar_str)
+hrp2_f_full_cg <- make_screen_formula(
+  "hrp2_t1", "hrp2_t2", "c_log_density * gravidity * centro", covar_str)
+
+hrp2_screen_hiv_reduced <- survival::survreg(hrp2_f_reduced_hiv, data = data, dist = "gaussian")
+hrp2_screen_hiv_full    <- survival::survreg(hrp2_f_full_hiv,    data = data, dist = "gaussian")
+hrp2_screen_gw_reduced  <- survival::survreg(hrp2_f_reduced_gw,  data = data, dist = "gaussian")
+hrp2_screen_gw_full     <- survival::survreg(hrp2_f_full_gw,     data = data, dist = "gaussian")
+hrp2_screen_cg_reduced  <- survival::survreg(hrp2_f_reduced_cg,  data = data, dist = "gaussian")
+hrp2_screen_cg_full     <- survival::survreg(hrp2_f_full_cg,     data = data, dist = "gaussian")
+
+hrp2_lrt <- dplyr::bind_rows(
+  lrt_survreg(hrp2_screen_hiv_reduced, hrp2_screen_hiv_full, "HIV x PCR density"),
+  lrt_survreg(hrp2_screen_gw_reduced,  hrp2_screen_gw_full,  "Gestational weeks x PCR density"),
+  lrt_survreg(hrp2_screen_cg_reduced,  hrp2_screen_cg_full,  "Centro x gravidity x PCR density")
+) %>% dplyr::mutate(outcome = "PfHRP2", .before = 1)
+
+## ============================================================
+## 2B) PfLDH screening
+## ============================================================
+ldh_f_reduced_hiv <- make_screen_formula("ldh_t1", "ldh_t2", "c_log_density + hiv", covar_str)
+ldh_f_full_hiv    <- make_screen_formula("ldh_t1", "ldh_t2", "c_log_density * hiv", covar_str)
+
+ldh_f_reduced_gw <- make_screen_formula("ldh_t1", "ldh_t2", "c_log_density + gestweeks", covar_str)
+ldh_f_full_gw    <- make_screen_formula("ldh_t1", "ldh_t2", "c_log_density * gestweeks", covar_str)
+
+ldh_f_reduced_cg <- make_screen_formula(
+  "ldh_t1", "ldh_t2",
+  "c_log_density * gravidity + c_log_density * centro + gravidity * centro",
+  covar_str)
+ldh_f_full_cg <- make_screen_formula(
+  "ldh_t1", "ldh_t2", "c_log_density * gravidity * centro", covar_str)
+
+ldh_screen_hiv_reduced <- survival::survreg(ldh_f_reduced_hiv, data = data, dist = "gaussian")
+ldh_screen_hiv_full    <- survival::survreg(ldh_f_full_hiv,    data = data, dist = "gaussian")
+ldh_screen_gw_reduced  <- survival::survreg(ldh_f_reduced_gw,  data = data, dist = "gaussian")
+ldh_screen_gw_full     <- survival::survreg(ldh_f_full_gw,     data = data, dist = "gaussian")
+ldh_screen_cg_reduced  <- survival::survreg(ldh_f_reduced_cg,  data = data, dist = "gaussian")
+ldh_screen_cg_full     <- survival::survreg(ldh_f_full_cg,     data = data, dist = "gaussian")
+
+ldh_lrt <- dplyr::bind_rows(
+  lrt_survreg(ldh_screen_hiv_reduced, ldh_screen_hiv_full, "HIV x PCR density"),
+  lrt_survreg(ldh_screen_gw_reduced,  ldh_screen_gw_full,  "Gestational weeks x PCR density"),
+  lrt_survreg(ldh_screen_cg_reduced,  ldh_screen_cg_full,  "Centro x gravidity x PCR density")
+) %>% dplyr::mutate(outcome = "PfLDH", .before = 1)
+
+screening_lrt_results <- dplyr::bind_rows(hrp2_lrt, ldh_lrt)
+
+write.csv(screening_lrt_results,
+          "WITHIN_INTERACTION_SCREENING_LRT_left_censored.csv", row.names = FALSE)
+
+cat("\n================ INTERACTION SCREENING (LRT) ================\n")
+print(screening_lrt_results)
+
+## ---------- Automatic selection ----------
+hrp2_add_hiv <- isTRUE(hrp2_lrt$significant_0.05[hrp2_lrt$interaction == "HIV x PCR density"])
+hrp2_add_gw  <- isTRUE(hrp2_lrt$significant_0.05[hrp2_lrt$interaction == "Gestational weeks x PCR density"])
+ldh_add_hiv  <- isTRUE(ldh_lrt$significant_0.05[ldh_lrt$interaction == "HIV x PCR density"])
+ldh_add_gw   <- isTRUE(ldh_lrt$significant_0.05[ldh_lrt$interaction == "Gestational weeks x PCR density"])
+
+core_linear <- "c_log_density * gravidity * centro"
+
+hrp2_extra <- c(if (hrp2_add_hiv) "c_log_density * hiv" else NULL,
+                if (hrp2_add_gw)  "c_log_density * gestweeks" else NULL)
+ldh_extra  <- c(if (ldh_add_hiv) "c_log_density * hiv" else NULL,
+                if (ldh_add_gw)  "c_log_density * gestweeks" else NULL)
+
+hrp2_rhs_linear <- paste(c(core_linear, hrp2_extra, covar_str), collapse = " + ")
+ldh_rhs_linear  <- paste(c(core_linear, ldh_extra,  covar_str), collapse = " + ")
+
+form_hrp2_cens <- stats::as.formula(
+  paste0("survival::Surv(hrp2_t1, hrp2_t2, type = 'interval2') ~ ", hrp2_rhs_linear))
+form_ldh_cens <- stats::as.formula(
+  paste0("survival::Surv(ldh_t1, ldh_t2, type = 'interval2') ~ ", ldh_rhs_linear))
+
+model_pfhrp2_total <- survival::survreg(form_hrp2_cens, data = data, dist = "gaussian")
+model_pfldh_total  <- survival::survreg(form_ldh_cens,  data = data, dist = "gaussian")
+
+cat("\n================ SELECTED FINAL LINEAR MODELS ================\n")
+cat("HRP2: centro x gravidity x PCR ALWAYS included (a priori)\n")
+cat("HRP2: HIV x PCR included:", hrp2_add_hiv, "\n")
+cat("HRP2: gestweeks x PCR included:", hrp2_add_gw, "\n")
+cat("\nPfLDH: centro x gravidity x PCR ALWAYS included (a priori)\n")
+cat("PfLDH: HIV x PCR included:", ldh_add_hiv, "\n")
+cat("PfLDH: gestweeks x PCR included:", ldh_add_gw, "\n")
+cat("\nHRP2 final formula:\n");  print(form_hrp2_cens)
+cat("\nPfLDH final formula:\n"); print(form_ldh_cens)
+
+## ============================================================
+## 2C) CUBIC-SPLINE JOINT MODELS
+## ============================================================
+spline_term <- paste0("splines::ns(c_log_density, df = ", SPLINE_DF, ")")
+core_spline <- paste0(spline_term, " * gravidity * centro")
+
+hrp2_spline_extra <- c(if (hrp2_add_hiv) paste0(spline_term, " * hiv") else NULL,
+                       if (hrp2_add_gw)  paste0(spline_term, " * gestweeks") else NULL)
+ldh_spline_extra  <- c(if (ldh_add_hiv) paste0(spline_term, " * hiv") else NULL,
+                       if (ldh_add_gw)  paste0(spline_term, " * gestweeks") else NULL)
+
+hrp2_rhs_spline <- paste(c(core_spline, hrp2_spline_extra, covar_str), collapse = " + ")
+ldh_rhs_spline  <- paste(c(core_spline, ldh_spline_extra,  covar_str), collapse = " + ")
+
+form_hrp2_spline <- stats::as.formula(
+  paste0("survival::Surv(hrp2_t1, hrp2_t2, type = 'interval2') ~ ", hrp2_rhs_spline))
+form_ldh_spline <- stats::as.formula(
+  paste0("survival::Surv(ldh_t1, ldh_t2, type = 'interval2') ~ ", ldh_rhs_spline))
+
+model_pfhrp2_spline_joint <- survival::survreg(form_hrp2_spline, data = data, dist = "gaussian")
+model_pfldh_spline_joint  <- survival::survreg(form_ldh_spline,  data = data, dist = "gaussian")
+
+## knots in parasites/uL, so you can see whether the spline has any
+## freedom where the findings are claimed
+bk <- splines::ns(data$c_log_density, df = SPLINE_DF)
+cat("\n================ SPLINE KNOTS =================\n")
+cat("Interior knots:",
+    paste(round(exp(attr(bk, "knots") + MU_LOG_DENSITY), 2), collapse = ", "),
+    "parasites/uL\n")
+cat("Boundary knots:",
+    paste(round(exp(attr(bk, "Boundary.knots") + MU_LOG_DENSITY), 2), collapse = ", "),
+    "parasites/uL\n")
+cat("A natural spline is LINEAR outside the boundary knots.\n")
+
+tidy_survreg <- function(fit) {
+  s <- summary(fit)$table
+  out <- as.data.frame(s)
+  out$term <- rownames(out)
+  rownames(out) <- NULL
+  out %>%
+    dplyr::rename(estimate = Value, std.error = `Std. Error`,
+                  statistic = z, p.value = p) %>%
+    dplyr::select(term, estimate, std.error, statistic, p.value)
+}
+
+spline_results <- dplyr::bind_rows(
+  tidy_survreg(model_pfhrp2_spline_joint) %>%
+    dplyr::mutate(model = "PfHRP2_joint_cubic_spline_left_censored",
+                  AIC = AIC(model_pfhrp2_spline_joint),
+                  n = n_obs(model_pfhrp2_spline_joint)),
+  tidy_survreg(model_pfldh_spline_joint) %>%
+    dplyr::mutate(model = "PfLDH_joint_cubic_spline_left_censored",
+                  AIC = AIC(model_pfldh_spline_joint),
+                  n = n_obs(model_pfldh_spline_joint))
+)
+
+write.csv(spline_results,
+          "WITHIN_JOINT_CUBIC_SPLINE_RESULTS_left_censored.csv", row.names = FALSE)
+
+model_comparison <- data.frame(
+  outcome = c("PfHRP2", "PfLDH"),
+  linear_AIC = c(AIC(model_pfhrp2_total), AIC(model_pfldh_total)),
+  spline_AIC = c(AIC(model_pfhrp2_spline_joint), AIC(model_pfldh_spline_joint)),
+  linear_logLik = c(as.numeric(logLik(model_pfhrp2_total)),
+                    as.numeric(logLik(model_pfldh_total))),
+  spline_logLik = c(as.numeric(logLik(model_pfhrp2_spline_joint)),
+                    as.numeric(logLik(model_pfldh_spline_joint))),
+  stringsAsFactors = FALSE
+) %>%
+  dplyr::mutate(dAIC = spline_AIC - linear_AIC,
+                prefers = ifelse(dAIC < 0, "spline", "linear"))
+
+write.csv(model_comparison,
+          "WITHIN_JOINT_LINEAR_vs_CUBIC_SPLINE_AIC_left_censored.csv", row.names = FALSE)
+
+cat("\n================ LINEAR vs SPLINE JOINT MODELS ================\n")
+print(model_comparison)
+cat("\nNegative dAIC favours the spline. A spline that fits no better\n")
+cat("answers reviewer point 6: the linear form is adequate and the\n")
+cat("low-density pattern is not an artefact of it.\n")
+
+## ============================================================
+## 3) Print model info + ANOVA
+## ============================================================
+n_hrp2 <- n_obs(model_pfhrp2_total)
+n_ldh  <- n_obs(model_pfldh_total)
+
+cat("\n================ MODELS =================\n")
+cat("N HRP2 (interval-censored):", n_hrp2, "\n")
+cat("N PfLDH (interval-censored):", n_ldh, "\n")
+cat("AIC HRP2 :", AIC(model_pfhrp2_total), "\n")
+cat("AIC PfLDH:", AIC(model_pfldh_total), "\n\n")
+
+cat("\nType II ANOVA HRP2 (survreg):\n");  print(car::Anova(model_pfhrp2_total, type = 2))
+cat("\nType II ANOVA PfLDH (survreg):\n"); print(car::Anova(model_pfldh_total,  type = 2))
+
+out <- dplyr::bind_rows(
+  tidy_survreg(model_pfhrp2_total) %>%
+    mutate(model = "log_pfhrp2_censored", AIC = AIC(model_pfhrp2_total), n = n_hrp2),
+  tidy_survreg(model_pfldh_total) %>%
+    mutate(model = "log_pfldh_censored", AIC = AIC(model_pfldh_total), n = n_ldh)
+)
+
+write.csv(out, "WITHIN_MODEL_RESULTS_HRP2_PfLDH.csv", row.names = FALSE)
+cat("Saved: WITHIN_MODEL_RESULTS_HRP2_PfLDH.csv\n")
+
+## ============================================================
+## 5) CONTRASTS — WITHIN SITE ONLY
+##
+## This is the only substantive change from the Primi-vs-all script.
+## One contrast per site: primigravidae minus multigravidae.
+## ============================================================
+grav_short <- function(g) {
+  g <- as.character(g)
+  ifelse(g == "primigravidae", "Primi",
+         ifelse(g == "multigravidae", "Multi", g))
+}
+
+make_methods_within_site <- function(emm_obj,
+                                     grav_var   = "gravidity",
+                                     centro_var = "centro",
+                                     primi_lvl  = "primigravidae",
+                                     multi_lvl  = "multigravidae") {
+  emm_df <- as.data.frame(emm_obj)
+  K <- nrow(emm_df)
+  if (K < 2) stop("emm_obj has <2 rows; cannot build contrasts.")
+  
+  g <- as.character(emm_df[[grav_var]])
+  s <- as.character(emm_df[[centro_var]])
+  
+  sites <- sort(unique(s))
+  methods <- list(); labels <- character(); idx <- 1L
+  
+  for (st in sites) {
+    i_primi <- which(g == primi_lvl & s == st)
+    i_multi <- which(g == multi_lvl & s == st)
+    if (!length(i_primi) || !length(i_multi)) {
+      warning("Site ", st, " lacks one gravidity group; contrast skipped.")
+      next
+    }
+    v <- numeric(K)
+    v[i_primi[1]] <-  1
+    v[i_multi[1]] <- -1
+    labels[idx]    <- paste0("Primi - Multi, ", st)
+    methods[[idx]] <- v
+    idx <- idx + 1L
+  }
+  
+  if (!length(methods)) stop("No within-site contrasts could be built.")
+  names(methods) <- labels
+  methods
+}
+
+tidy_contrasts <- function(pw_sidak, pw_raw, label) {
+  as.data.frame(summary(pw_sidak, infer = c(TRUE, TRUE))) %>%
+    dplyr::rename(p_sidak = p.value) %>%
+    dplyr::left_join(
+      as.data.frame(summary(pw_raw)) %>%
+        dplyr::select(contrast, p.value) %>%
+        dplyr::rename(p_raw = p.value),
+      by = "contrast"
+    ) %>%
+    dplyr::mutate(model = label)
+}
+
+## fold-differences, since the outcome is log1p(antigen)
+fold_cols <- function(df) df %>%
+  dplyr::mutate(fold = exp(estimate),
+                fold_low = exp(lower.CL),
+                fold_high = exp(upper.CL))
+
+## ============================================================
+## 6) LEVELS at a common density point
+## ============================================================
+slope_var <- "c_log_density"
+
+c_at <- 0
+if (is.finite(COMMON_C_LOW) && is.finite(COMMON_C_HIGH) && COMMON_C_LOW < COMMON_C_HIGH) {
+  if (!(c_at >= COMMON_C_LOW && c_at <= COMMON_C_HIGH)) {
+    c_at <- mean(c(COMMON_C_LOW, COMMON_C_HIGH))
+  }
+}
+
+cat(sprintf("\nEMMEANS evaluated at %.2f parasites/uL\n", exp(c_at + MU_LOG_DENSITY)))
+
+emm_pfhrp2 <- emmeans(model_pfhrp2_total, ~ gravidity * centro,
+                      at = setNames(list(c_at), slope_var))
+emm_pfldh  <- emmeans(model_pfldh_total,  ~ gravidity * centro,
+                      at = setNames(list(c_at), slope_var))
+
+meth_levels_pfhrp2 <- make_methods_within_site(emm_pfhrp2)
+meth_levels_pfldh  <- make_methods_within_site(emm_pfldh)
+
+cat("Within-site contrasts:", length(meth_levels_pfhrp2), "per marker\n")
+cat("Sidak threshold with", length(meth_levels_pfhrp2), "contrasts:",
+    round(1 - (1 - 0.05)^(1 / length(meth_levels_pfhrp2)), 4),
+    " (it was 0.0043 with 12)\n")
+
+pw_pfhrp2_raw   <- contrast(emm_pfhrp2, method = meth_levels_pfhrp2, adjust = "none")
+pw_pfhrp2_sidak <- contrast(emm_pfhrp2, method = meth_levels_pfhrp2, adjust = "sidak")
+pw_pfldh_raw    <- contrast(emm_pfldh,  method = meth_levels_pfldh,  adjust = "none")
+pw_pfldh_sidak  <- contrast(emm_pfldh,  method = meth_levels_pfldh,  adjust = "sidak")
+
+levels_hrp2_df <- tidy_contrasts(pw_pfhrp2_sidak, pw_pfhrp2_raw, "HRP2 level")
+levels_ldh_df  <- tidy_contrasts(pw_pfldh_sidak,  pw_pfldh_raw,  "PfLDH level")
+
+write.csv(fold_cols(levels_hrp2_df), "WITHIN_LEVELS_contrasts_HRP2_Sidak.csv", row.names = FALSE)
+write.csv(fold_cols(levels_ldh_df),  "WITHIN_LEVELS_contrasts_PfLDH_Sidak.csv", row.names = FALSE)
+
+cat("\n---- WITHIN-SITE excess at matched density ----\n")
+print(as.data.frame(
+  dplyr::bind_rows(fold_cols(levels_hrp2_df), fold_cols(levels_ldh_df)) %>%
+    dplyr::mutate(dplyr::across(c(fold, fold_low, fold_high), ~ round(.x, 2)),
+                  p_raw = signif(p_raw, 3), p_sidak = signif(p_sidak, 3)) %>%
+    dplyr::select(model, contrast, fold, fold_low, fold_high, p_raw, p_sidak)))
+cat("\nfold = ratio of (1 + antigen), primigravidae over multigravidae,\n")
+cat("at the same parasite density, within the same site.\n")
+
+## ============================================================
+## 7) SLOPES — within site
+## ============================================================
+tr_hrp2  <- emtrends(model_pfhrp2_total, specs = ~ gravidity * centro, var = slope_var)
+tr_pfldh <- emtrends(model_pfldh_total,  specs = ~ gravidity * centro, var = slope_var)
+
+meth_slope_hrp2  <- make_methods_within_site(tr_hrp2)
+meth_slope_pfldh <- make_methods_within_site(tr_pfldh)
+
+pw_hrp2_raw   <- contrast(tr_hrp2,  method = meth_slope_hrp2,  adjust = "none")
+pw_hrp2_sidak <- contrast(tr_hrp2,  method = meth_slope_hrp2,  adjust = "sidak")
+pw_pfldh_raw   <- contrast(tr_pfldh, method = meth_slope_pfldh, adjust = "none")
+pw_pfldh_sidak <- contrast(tr_pfldh, method = meth_slope_pfldh, adjust = "sidak")
+
+slopes_hrp2_df <- tidy_contrasts(pw_hrp2_sidak,  pw_hrp2_raw,  "HRP2 slope")
+slopes_ldh_df  <- tidy_contrasts(pw_pfldh_sidak, pw_pfldh_raw, "PfLDH slope")
+
+slopes_all <- bind_rows(slopes_hrp2_df, slopes_ldh_df)
+
+write.csv(slopes_all, "WITHIN_SLOPES_contrasts_Sidak.csv", row.names = FALSE)
+
+cat("\n---- Within-site slope differences ----\n")
+print(as.data.frame(slopes_all %>%
+                      mutate(across(c(estimate, lower.CL, upper.CL), ~ round(.x, 3)),
+                             p_raw = signif(p_raw, 3), p_sidak = signif(p_sidak, 3)) %>%
+                      select(model, contrast, estimate, lower.CL, upper.CL, p_raw, p_sidak)))
+cat("\nThis asks whether the gap CHANGES with density, not how big it\n")
+cat("is. A null here means the excess is constant across densities.\n")
+
+## ============================================================
+## 8) Forest plots
+## ============================================================
+fmt_p <- function(p, lbl) {
+  base <- ifelse(is.na(p), paste0(lbl, " p = NA"), sprintf("%s p = %.3f", lbl, p))
+  ifelse(!is.na(p) & p < 0.05, paste0("<b>", base, "</b>"), base)
+}
+
+make_panel_forest <- function(df, title, colour_hex, show_y_labels = TRUE, ylim_max = NULL,
+                              p_label_size = 3.8, right_margin = 70) {
+  g <- ggplot(df, aes(x = contrast, y = estimate)) +
+    geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.55) +
+    geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), width = 0.24,
+                  linewidth = 0.9, color = colour_hex) +
+    geom_point(shape = 22, size = 4.5, stroke = 1.0, fill = colour_hex, color = "black") +
+    ggtext::geom_richtext(
+      aes(y = label_y, label = p_label),
+      hjust = 0, size = p_label_size, fill = "white",
+      label.color = "black", color = "black",
+      label.padding = grid::unit(c(0.13, 0.16, 0.13, 0.16), "lines"),
+      label.r = grid::unit(0.08, "lines")
+    ) +
+    coord_flip(clip = "off") +
+    labs(title = title, x = NULL, y = NULL) +
+    theme_classic(base_size = 13) +
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.85),
+      axis.text.y = element_text(color = "black", size = 11.5),
+      axis.text.x = element_text(color = "black", size = 11),
+      plot.title  = element_text(face = "bold", size = 13.8, color = "black"),
+      plot.margin = margin(10, right_margin, 10, 10)
+    )
+  
+  if (!is.null(ylim_max))
+    g <- g + scale_y_continuous(limits = c(-ylim_max, ylim_max),
+                                expand = expansion(mult = c(0.04, 0.16)))
+  if (!show_y_labels)
+    g <- g + theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+  g
+}
+
+prep_forest_df <- function(df_in) {
+  df <- df_in %>%
+    mutate(contrast = as.character(contrast),
+           p_label  = paste0(fmt_p(p_raw, "raw"), "<br/>", fmt_p(p_sidak, "Sidak")))
+  ylim_max <- max(abs(c(df$lower.CL, df$upper.CL)), na.rm = TRUE) * 1.38
+  span <- 2 * ylim_max
+  df <- df %>% mutate(label_y = pmin(upper.CL + 0.055 * span, ylim_max - 0.04 * span))
+  list(df = df, ylim_max = ylim_max)
+}
+
+## ---- Forest: LEVELS ----
+lev_hrp2 <- prep_forest_df(levels_hrp2_df)$df
+lev_ldh  <- prep_forest_df(levels_ldh_df)$df
+
+contrast_order <- lev_hrp2 %>% arrange(estimate) %>% pull(contrast)
+lev_hrp2 <- lev_hrp2 %>% mutate(contrast = factor(contrast, levels = contrast_order))
+lev_ldh  <- lev_ldh  %>% mutate(contrast = factor(contrast, levels = contrast_order))
+
+ylim_max_levels <- max(
+  abs(c(lev_hrp2$lower.CL, lev_hrp2$upper.CL, lev_ldh$lower.CL, lev_ldh$upper.CL)),
+  na.rm = TRUE) * 1.38
+
+p_levels <- make_panel_forest(lev_hrp2, "HRP2: Primi vs Multi within site",
+                              burgundy, TRUE, ylim_max_levels) +
+  make_panel_forest(lev_ldh, "PfLDH: Primi vs Multi within site",
+                    blue, FALSE, ylim_max_levels) +
+  patchwork::plot_layout(widths = c(1, 1))
+
+cat("\n--- Printing FOREST (LEVELS) ---\n")
+print(p_levels)
+
+ggsave("WITHIN_FOREST_LEVELS_HRP2_PfLDH.png", p_levels,
+       width = 16, height = 5, dpi = 700)
+
+## ---- Forest: SLOPES ----
+sl_hrp2 <- slopes_hrp2_df %>%
+  mutate(p_label = paste0(fmt_p(p_raw,"raw"), "<br/>", fmt_p(p_sidak,"Sidak")))
+sl_ldh <- slopes_ldh_df %>%
+  mutate(p_label = paste0(fmt_p(p_raw,"raw"), "<br/>", fmt_p(p_sidak,"Sidak")))
+
+contrast_order_s <- sl_hrp2 %>% arrange(estimate) %>% pull(contrast)
+sl_hrp2 <- sl_hrp2 %>% mutate(contrast = factor(as.character(contrast), levels = contrast_order_s))
+sl_ldh  <- sl_ldh  %>% mutate(contrast = factor(as.character(contrast), levels = contrast_order_s))
+
+ylim_max_slopes <- max(
+  abs(c(sl_hrp2$lower.CL, sl_hrp2$upper.CL, sl_ldh$lower.CL, sl_ldh$upper.CL)),
+  na.rm = TRUE) * 1.42
+span_s <- 2 * ylim_max_slopes
+
+sl_hrp2 <- sl_hrp2 %>%
+  mutate(label_y = pmin(upper.CL + 0.055 * span_s, ylim_max_slopes - 0.04 * span_s))
+sl_ldh <- sl_ldh %>%
+  mutate(label_y = pmin(upper.CL + 0.055 * span_s, ylim_max_slopes - 0.04 * span_s))
+
+p_slopes <- make_panel_forest(sl_hrp2, "HRP2 slopes, within site",
+                              burgundy, TRUE, ylim_max_slopes, p_label_size = 3.9) +
+  make_panel_forest(sl_ldh, "PfLDH slopes, within site",
+                    blue, FALSE, ylim_max_slopes, p_label_size = 3.9) +
+  patchwork::plot_layout(widths = c(1, 1))
+
+cat("\n--- Printing FOREST (SLOPES) ---\n")
+print(p_slopes)
+
+ggsave("WITHIN_FOREST_SLOPES_HRP2_PfLDH.png", p_slopes,
+       width = 16, height = 5, dpi = 700)
+
+## ============================================================
+## 9) Lines: adjusted antigen-density curves, faceted by site
+## ============================================================
+mu_logdens <- MU_LOG_DENSITY
+
+if (is.finite(COMMON_C_LOW) && is.finite(COMMON_C_HIGH) && COMMON_C_LOW < COMMON_C_HIGH) {
+  c_seq <- seq(COMMON_C_LOW, COMMON_C_HIGH, length.out = 25)
+} else {
+  c_vals <- na.omit(model.frame(model_pfhrp2_total)[[slope_var]])
+  c_seq  <- unique(quantile(c_vals, probs = seq(0.05, 0.95, by = 0.05), na.rm = TRUE))
+}
+
+predict_lines <- function(model, marker_label) {
+  out <- lapply(c_seq, function(cc) {
+    em <- emmeans(model, specs = ~ gravidity * centro, at = list(c_log_density = cc))
+    as.data.frame(em) %>% mutate(c_val = cc)
+  }) %>% bind_rows()
+  
+  out %>%
+    mutate(
+      marker  = marker_label,
+      grav    = grav_short(gravidity),
+      site    = as.character(centro),
+      density = pmax(exp(c_val + mu_logdens), 1e-8),
+      antigen       = exp(emmean) - 1,
+      antigen_lower = exp(lower.CL) - 1,
+      antigen_upper = exp(upper.CL) - 1
+    )
+}
+
+lines_all <- bind_rows(predict_lines(model_pfhrp2_total, "HRP2"),
+                       predict_lines(model_pfldh_total,  "PfLDH"))
+
+## faceted by site, so the within-site comparison is the one the eye
+## makes: two curves per panel
+p_lines <- ggplot(lines_all, aes(x = density, y = pmax(antigen, 1e-4),
+                                 colour = grav, fill = grav)) +
+  geom_ribbon(aes(ymin = pmax(antigen_lower, 1e-4), ymax = pmax(antigen_upper, 1e-4)),
+              alpha = 0.12, colour = NA) +
+  geom_line(linewidth = 1.05) +
+  scale_x_log10(labels = label_number(accuracy = 0.01, big.mark = ",")) +
+  scale_y_log10(labels = label_number(accuracy = 0.01, big.mark = ",")) +
+  scale_colour_manual(values = c(Primi = "#C1440E", Multi = "#2C6E91")) +
+  scale_fill_manual(values   = c(Primi = "#C1440E", Multi = "#2C6E91")) +
+  facet_grid(marker ~ site, scales = "free_y") +
+  labs(x = "qPCR parasite density (parasites/µL; log scale)",
+       y = "Predicted antigen concentration (pg/mL; log scale)",
+       colour = NULL, fill = NULL) +
+  theme_classic(base_size = 13) +
+  theme(
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.7),
+    strip.background = element_rect(fill = "white", colour = "black", linewidth = 0.7),
+    strip.text = element_text(face = "bold", size = 12, color = "black"),
+    legend.position = "bottom",
+    axis.title = element_text(size = 13, color = "black"),
+    axis.text = element_text(size = 10.5, color = "black")
+  )
+
+cat("\n--- Printing LINES plot ---\n")
+print(p_lines)
+
+ggsave("WITHIN_LINES_adjusted_antigen_density.png", p_lines,
+       width = 13, height = 7.5, dpi = 700)
+
+## ============================================================
+## 10) HASTA/DESDE curves, within site
+## ============================================================
+clean_text <- function(x) {
+  if (is.null(x)) return(x)
+  x <- as.character(x)
+  x <- enc2utf8(x)
+  x <- gsub("ManhiÃ§a", "Manhiça", x, fixed = TRUE)
+  x <- gsub("â€“", "-", x, fixed = TRUE)
+  x <- gsub("\u2013", "-", x, fixed = TRUE)
+  x <- gsub("\u2014", "-", x, fixed = TRUE)
+  x <- gsub("\u2212", "-", x, fixed = TRUE)
+  x <- gsub("\u00A0", " ", x, fixed = TRUE)
+  x <- gsub("[[:space:]]+", " ", x)
+  x <- gsub("[[:cntrl:]]", "", x)
+  trimws(x)
+}
+
+write_csv_utf8_bom <- function(df, file) {
+  con <- file(file, open = "wb")
+  on.exit(close(con), add = TRUE)
+  writeBin(charToRaw("\ufeff"), con)
+  utils::write.csv(df, con, row.names = FALSE)
+}
+
+find_segments <- function(x, flag) {
+  flag <- as.logical(flag)
+  flag[is.na(flag)] <- FALSE
+  if (!any(flag)) return(data.frame(start = numeric(0), end = numeric(0)))
+  r <- rle(flag)
+  ends <- cumsum(r$lengths)
+  starts <- ends - r$lengths + 1
+  idx_true <- which(r$values)
+  data.frame(start = x[starts[idx_true]], end = x[ends[idx_true]])
+}
+
+segments_to_string <- function(seg) {
+  if (nrow(seg) == 0) return("none")
+  paste(sprintf("%g-%g", seg$start, seg$end), collapse = "; ")
+}
+
+## one pair per site: primigravidae vs multigravidae
+build_within_site_pairs <- function(groups_df,
+                                    primi_lvl = "primigravidae",
+                                    multi_lvl = "multigravidae") {
+  groups_df <- groups_df %>% distinct(gravidity, centro)
+  groups_df$gravidity <- as.character(groups_df$gravidity)
+  groups_df$centro    <- as.character(groups_df$centro)
+  
+  sites <- sort(unique(groups_df$centro))
+  out <- list(); k <- 1L
+  
+  for (st in sites) {
+    has_p <- any(groups_df$gravidity == primi_lvl & groups_df$centro == st)
+    has_m <- any(groups_df$gravidity == multi_lvl & groups_df$centro == st)
+    if (!has_p || !has_m) next
+    
+    out[[k]] <- data.frame(
+      g1 = primi_lvl, c1 = st,
+      g2 = multi_lvl, c2 = st,
+      contrast = paste0("Primi - Multi, ", st),
+      stringsAsFactors = FALSE
+    )
+    k <- k + 1L
+  }
+  
+  if (!length(out)) return(data.frame())
+  bind_rows(out) %>% distinct(contrast, .keep_all = TRUE)
+}
+
+make_newdata_fixed <- function(model, grav, cent, c_var_name, c_value) {
+  
+  ## For the LINEAR model, c_log_density is a raw predictor present
+  ## in model.frame(). For the SPLINE model, model.frame() holds the
+  ## evaluated ns() basis instead, so newdata must be built from the
+  ## ORIGINAL variables in the formula, not from model.frame() names.
+  ## model.matrix() then re-evaluates ns() using the knots stored in
+  ## the terms object.
+  
+  mf <- model.frame(model)
+  tt <- delete.response(stats::terms(model))
+  required_vars <- all.vars(tt)
+  
+  if (!c_var_name %in% required_vars)
+    stop("Model formula does not contain predictor: ", c_var_name)
+  
+  nd <- as.data.frame(
+    matrix(NA, nrow = 1, ncol = length(required_vars)),
+    stringsAsFactors = FALSE
+  )
+  names(nd) <- required_vars
+  
+  nd[[c_var_name]] <- c_value
+  if ("gravidity" %in% names(nd)) nd$gravidity <- grav
+  if ("centro"    %in% names(nd)) nd$centro    <- cent
+  
+  for (nm in names(nd)) {
+    
+    if (nm %in% c(c_var_name, "gravidity", "centro")) next
+    
+    if (nm %in% names(mf)) {
+      x <- mf[[nm]]
+      if (is.factor(x)) {
+        tab <- table(x); nd[[nm]] <- names(tab)[which.max(tab)]
+      } else if (is.numeric(x) || is.integer(x)) {
+        nd[[nm]] <- mean(x, na.rm = TRUE)
+      } else {
+        ok <- which(!is.na(x)); nd[[nm]] <- if (length(ok)) x[ok[1]] else NA
+      }
+      
+    } else if (exists("data", envir = .GlobalEnv) &&
+               nm %in% names(get("data", envir = .GlobalEnv))) {
+      x <- get("data", envir = .GlobalEnv)[[nm]]
+      if (is.factor(x)) {
+        tab <- table(x); nd[[nm]] <- names(tab)[which.max(tab)]
+      } else if (is.numeric(x) || is.integer(x)) {
+        nd[[nm]] <- mean(x, na.rm = TRUE)
+      } else {
+        ok <- which(!is.na(x)); nd[[nm]] <- if (length(ok)) x[ok[1]] else NA
+      }
+      
+    } else {
+      stop("Cannot construct newdata: model requires variable '", nm,
+           "' but it is not available in the fitted model frame or `data`.")
+    }
+  }
+  
+  xlev <- model$xlevels
+  if (!is.null(xlev)) {
+    for (nm in intersect(names(xlev), names(nd)))
+      nd[[nm]] <- factor(nd[[nm]], levels = xlev[[nm]])
+  }
+  
+  nd
+}
+
+contrast_curve_exact <- function(model, raw_grid, mu_log_raw, c_var_name,
+                                 g1, c1, g2, c2, alpha = 0.05,
+                                 nsim = 5000, seed = 20261002) {
+  
+  ## ------------------------------------------------------------
+  ## SIMULTANEOUS 95% CONFIDENCE BAND
+  ##
+  ## The contrast is evaluated over the whole qPCR-density grid.
+  ## Instead of 200 pointwise 95% CIs, coefficient vectors are drawn
+  ## from N(beta_hat, V_hat); for each draw we take the largest
+  ## absolute standardized deviation over the ENTIRE curve. The 95th
+  ## percentile of those maxima is the critical value for the band.
+  ##
+  ## This controls the family-wise error rate along the density axis
+  ## while preserving the correlation between neighbouring densities,
+  ## which a Bonferroni correction over 200 grid points would ignore.
+  ## It is reviewer point 5.
+  ##
+  ## SCOPE: simultaneous ACROSS DENSITIES within one contrast. Across
+  ## the three within-site contrasts, the Sidak-adjusted levels table
+  ## is the family-wise statement.
+  ## ------------------------------------------------------------
+  
+  u <- usable(model)
+  
+  if (is.null(u)) {
+    out <- data.frame(x_raw = raw_grid, diff = NA_real_, se = NA_real_,
+                      lower = NA_real_, upper = NA_real_,
+                      sig_pos = FALSE, sig_neg = FALSE)
+    return(list(
+      curve = out,
+      summary = data.frame(
+        last_pos_x = NA_real_, first_neg_x = NA_real_,
+        seg_pos = NA_character_, seg_neg = NA_character_,
+        x_min_used = min(raw_grid), x_max_used = max(raw_grid),
+        n_grid = length(raw_grid),
+        simultaneous_critical = NA_real_,
+        confidence_level = 1 - alpha,
+        nsim = nsim,
+        note = "No usable non-aliased coefficients/covariance matrix available.")
+    ))
+  }
+  
+  tt_noy <- delete.response(terms(model))
+  
+  Xdiff <- matrix(NA_real_, nrow = length(raw_grid), ncol = length(u$names),
+                  dimnames = list(NULL, u$names))
+  
+  for (i in seq_along(raw_grid)) {
+    xc <- log(raw_grid[i]) - mu_log_raw
+    
+    nd1 <- make_newdata_fixed(model, grav = g1, cent = c1,
+                              c_var_name = c_var_name, c_value = xc)
+    nd2 <- make_newdata_fixed(model, grav = g2, cent = c2,
+                              c_var_name = c_var_name, c_value = xc)
+    
+    X1 <- tryCatch(model.matrix(tt_noy, nd1), error = function(e) NULL)
+    X2 <- tryCatch(model.matrix(tt_noy, nd2), error = function(e) NULL)
+    if (is.null(X1) || is.null(X2)) next
+    if (!all(u$names %in% colnames(X1)) || !all(u$names %in% colnames(X2))) next
+    
+    Xdiff[i, ] <- X1[, u$names, drop = FALSE] - X2[, u$names, drop = FALSE]
+  }
+  
+  valid <- apply(Xdiff, 1, function(z) all(is.finite(z)))
+  
+  if (!any(valid))
+    stop("No valid design rows could be constructed for the simultaneous band.")
+  
+  Xv <- Xdiff[valid, , drop = FALSE]
+  x_grid_valid <- raw_grid[valid]
+  
+  beta_hat <- u$beta
+  V_hat    <- u$V
+  
+  diff_hat <- as.numeric(Xv %*% beta_hat)
+  
+  ## pointwise SEs standardize the simulated deviations; the band
+  ## itself uses the simultaneous critical value, not qnorm(0.975)
+  se_diff <- sqrt(pmax(0, rowSums((Xv %*% V_hat) * Xv)))
+  
+  se_ok <- is.finite(se_diff) & se_diff > 0
+  if (!any(se_ok))
+    stop("The contrast has no positive finite standard errors; ",
+         "cannot construct a simultaneous confidence band.")
+  
+  set.seed(seed)
+  
+  beta_sim <- MASS::mvrnorm(n = nsim, mu = beta_hat, Sigma = V_hat,
+                            empirical = FALSE)
+  
+  ## rows = simulations, columns = density grid points
+  sim_diff <- beta_sim %*% t(Xv)
+  
+  z_sim <- sweep(sweep(sim_diff, 2, diff_hat, "-"), 2, se_diff, "/")
+  z_sim <- z_sim[, se_ok, drop = FALSE]
+  
+  max_abs_z <- apply(abs(z_sim), 1, max, na.rm = TRUE)
+  
+  crit <- as.numeric(stats::quantile(max_abs_z, probs = 1 - alpha,
+                                     na.rm = TRUE, names = FALSE))
+  
+  lower <- diff_hat - crit * se_diff
+  upper <- diff_hat + crit * se_diff
+  
+  out <- data.frame(x_raw = x_grid_valid, diff = diff_hat, se = se_diff,
+                    lower = lower, upper = upper) %>%
+    mutate(sig_pos = is.finite(lower) & lower > 0,
+           sig_neg = is.finite(upper) & upper < 0)
+  
+  seg_pos <- find_segments(out$x_raw, out$sig_pos)
+  seg_neg <- find_segments(out$x_raw, out$sig_neg)
+  
+  list(
+    curve = out,
+    summary = data.frame(
+      last_pos_x  = if (any(out$sig_pos, na.rm = TRUE)) max(out$x_raw[out$sig_pos], na.rm = TRUE) else NA_real_,
+      first_neg_x = if (any(out$sig_neg, na.rm = TRUE)) min(out$x_raw[out$sig_neg], na.rm = TRUE) else NA_real_,
+      seg_pos     = segments_to_string(seg_pos),
+      seg_neg     = segments_to_string(seg_neg),
+      x_min_used  = min(out$x_raw),
+      x_max_used  = max(out$x_raw),
+      n_grid      = nrow(out),
+      simultaneous_critical = crit,
+      confidence_level = 1 - alpha,
+      nsim = nsim,
+      note = "Simultaneous band from parametric MVN coefficient simulation; significance requires the band to exclude zero."
+    )
+  )
+}
+
+make_shade_boundary_labels <- function(df_one_contrast, unit_suffix) {
+  df <- df_one_contrast
+  if (!nrow(df)) return(NULL)
+  
+  sp <- df$sig_pos; sp[is.na(sp)] <- FALSE
+  sn <- df$sig_neg; sn[is.na(sn)] <- FALSE
+  
+  seg_pos <- find_segments(df$x_raw, sp)
+  seg_neg <- find_segments(df$x_raw, sn)
+  
+  ymin <- min(c(df$lower, df$diff, 0), na.rm = TRUE)
+  ymax <- max(c(df$upper, df$diff, 0), na.rm = TRUE)
+  span <- if (is.finite(ymax - ymin) && (ymax - ymin) > 0) (ymax - ymin) else 1
+  
+  y_top_base <- ymax - 0.08 * span
+  y_bot_base <- ymin + 0.08 * span
+  step <- 0.14 * span
+  
+  labfun <- scales::label_number(accuracy = 0.01, big.mark = ",")
+  
+  build_labels_from_segments <- function(seg, y_base, direction = c("down", "up")) {
+    direction <- match.arg(direction)
+    if (!nrow(seg)) return(NULL)
+    
+    labs <- dplyr::bind_rows(
+      data.frame(x_raw = seg$start, boundary = "start", stringsAsFactors = FALSE),
+      data.frame(x_raw = seg$end,   boundary = "end",   stringsAsFactors = FALSE)
+    ) %>%
+      dplyr::distinct(x_raw, boundary) %>%
+      dplyr::arrange(x_raw, boundary)
+    
+    if (!nrow(labs)) return(NULL)
+    
+    labs %>%
+      dplyr::mutate(
+        idx = dplyr::row_number(),
+        y   = if (direction == "down") (y_base - (idx - 1) * step) else (y_base + (idx - 1) * step),
+        y   = pmin(pmax(y, ymin + 0.03 * span), ymax - 0.03 * span),
+        label = paste0(labfun(x_raw), "\n", unit_suffix),
+        hjust = 0.5
+      ) %>%
+      dplyr::select(x_raw, y, label, hjust)
+  }
+  
+  out_pos <- build_labels_from_segments(seg_pos, y_top_base, direction = "down")
+  out_neg <- build_labels_from_segments(seg_neg, y_bot_base, direction = "up")
+  
+  out <- dplyr::bind_rows(out_pos, out_neg)
+  if (is.null(out) || !nrow(out)) return(NULL)
+  
+  out %>%
+    dplyr::mutate(contrast = df$contrast[1]) %>%
+    dplyr::select(contrast, x_raw, y, label, hjust)
+}
+
+make_log_breaks <- function(x_limits) {
+  cand <- c(0.01, 0.1, 1, 10, 100, 1000, 10000, 100000)
+  cand[cand >= x_limits[1] & cand <= x_limits[2]]
+}
+
+plot_contrast_curves <- function(curves_df, labels_df, title_txt, colour_hex,
+                                 x_label, y_expr, x_limits = NULL, x_breaks = NULL) {
+  
+  if (is.null(labels_df) || !nrow(labels_df) ||
+      !("contrast" %in% names(labels_df))) {
+    vlines_df <- data.frame(contrast = character(0), x_raw = numeric(0))
+    labels_df <- data.frame(
+      contrast = character(0), x_raw = numeric(0), y = numeric(0),
+      label = character(0), hjust = numeric(0)
+    )
+  } else {
+    vlines_df <- labels_df %>% dplyr::distinct(contrast, x_raw)
+  }
+  
+  g <- ggplot(curves_df, aes(x = x_raw)) +
+    geom_ribbon(aes(ymin = lower, ymax = upper), fill = colour_hex, alpha = 0.18, colour = NA) +
+    geom_ribbon(data = curves_df %>% dplyr::filter(sig_pos),
+                aes(ymin = lower, ymax = upper), fill = colour_hex, alpha = 0.30, colour = NA) +
+    geom_ribbon(data = curves_df %>% dplyr::filter(sig_neg),
+                aes(ymin = lower, ymax = upper), fill = colour_hex, alpha = 0.30, colour = NA) +
+    geom_line(aes(y = diff), colour = colour_hex, linewidth = 1.0) +
+    geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.55) +
+    geom_vline(
+      data = vlines_df, aes(xintercept = x_raw), inherit.aes = FALSE,
+      linetype = "dotted", linewidth = 0.45, colour = "black", alpha = 0.65
+    ) +
+    geom_text(
+      data = labels_df, aes(x = x_raw, y = y, label = label, hjust = hjust),
+      inherit.aes = FALSE, size = 4.5, vjust = 0.5, color = "black",
+      lineheight = 0.95, check_overlap = FALSE
+    ) +
+    labs(title = title_txt, x = x_label, y = y_expr) +
+    theme_classic(base_size = 13) +
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.7),
+      strip.background = element_rect(fill = "white", colour = "black", linewidth = 0.7),
+      strip.text = element_text(face = "bold", size = 12, color = "black"),
+      plot.title = element_text(face = "bold", size = 14.5, color = "black", lineheight = 1.05),
+      axis.title = element_text(size = 13, color = "black"),
+      axis.text = element_text(size = 10.8, color = "black"),
+      plot.margin = margin(10, 12, 10, 10)
+    )
+  
+  if (!is.null(x_limits)) {
+    g <- g + scale_x_log10(
+      limits = x_limits, breaks = x_breaks,
+      labels = scales::label_number(accuracy = 0.01, big.mark = ",")
+    )
+  } else {
+    g <- g + scale_x_log10(labels = scales::label_number(accuracy = 0.01, big.mark = ","))
+  }
+  
+  g
+}
+
+safe_ggsave <- function(filename, plot, width, height, dpi = NULL, device = NULL) {
+  args <- list(filename = filename, plot = plot, width = width, height = height)
+  if (!is.null(dpi)) args$dpi <- dpi
+  if (!is.null(device)) args$device <- device
+  
+  ok <- tryCatch({ do.call(ggplot2::ggsave, args); TRUE },
+                 error = function(e) {
+                   message("Could not save '", filename, "': ", conditionMessage(e))
+                   FALSE })
+  if (ok) return(filename)
+  
+  ext <- tools::file_ext(filename)
+  stem <- tools::file_path_sans_ext(filename)
+  fallback <- paste0(stem, "_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".", ext)
+  
+  ok2 <- tryCatch({ do.call(ggplot2::ggsave, modifyList(args, list(filename = fallback))); TRUE },
+                  error = function(e) {
+                    message("Fallback save also failed for '", fallback, "': ",
+                            conditionMessage(e))
+                    FALSE })
+  if (ok2) { message("Saved fallback file: ", fallback); return(fallback) }
+  NA_character_
+}
+
+run_hasta_desde_within_site <- function(model_obj,
+                                        marker_tag,
+                                        colour_hex,
+                                        y_expr,
+                                        unit_suffix,
+                                        common_c_low = COMMON_C_LOW,
+                                        common_c_high = COMMON_C_HIGH,
+                                        x_limits_shared = NULL,
+                                        x_breaks_shared = NULL) {
+  cat("\n======== Density ranges where the SIMULTANEOUS 95% band",
+      "excludes zero, within site:", marker_tag, "========\n")
+  
+  mf_used <- model.frame(model_obj)
+  mu_logdens_center <- MU_LOG_DENSITY
+  
+  if (is.finite(common_c_low) && is.finite(common_c_high) && common_c_low < common_c_high) {
+    x_min <- pmax(exp(common_c_low  + mu_logdens_center), 1e-8)
+    x_max <- pmax(exp(common_c_high + mu_logdens_center), 1e-8)
+  } else {
+    raw_vec <- data$density
+    raw_vec <- raw_vec[is.finite(raw_vec) & !is.na(raw_vec) & raw_vec > 0]
+    x_min <- as.numeric(quantile(raw_vec, 0.01, na.rm = TRUE))
+    x_max <- as.numeric(quantile(raw_vec, 0.99, na.rm = TRUE))
+  }
+  
+  if (!is.finite(x_min) || !is.finite(x_max) || x_min >= x_max) {
+    cat("WARNING: invalid density grid bounds; skipping.\n")
+    return(invisible(NULL))
+  }
+  
+  x_grid <- exp(seq(log(x_min), log(x_max), length.out = 200))
+  
+  groups <- mf_used %>% distinct(gravidity, centro)
+  pairs_df <- build_within_site_pairs(groups)
+  if (!nrow(pairs_df)) {
+    cat("WARNING: no site has both gravidity groups; skipping.\n")
+    return(invisible(NULL))
+  }
+  pairs_df$contrast <- clean_text(pairs_df$contrast)
+  
+  cat("Grid:", signif(min(x_grid), 4), "to", signif(max(x_grid), 4), "(n=200)\n")
+  cat("Within-site contrasts:", nrow(pairs_df), "\n")
+  
+  res_list <- lapply(seq_len(nrow(pairs_df)), function(ii) {
+    rr <- contrast_curve_exact(
+      model      = model_obj,
+      raw_grid   = x_grid,
+      mu_log_raw = mu_logdens_center,
+      c_var_name = "c_log_density",
+      g1 = pairs_df$g1[ii], c1 = pairs_df$c1[ii],
+      g2 = pairs_df$g2[ii], c2 = pairs_df$c2[ii]
+    )
+    list(curve   = rr$curve   %>% mutate(contrast = pairs_df$contrast[ii]),
+         summary = rr$summary %>% mutate(contrast = pairs_df$contrast[ii]))
+  })
+  
+  curves_all <- bind_rows(lapply(res_list, `[[`, "curve"))
+  summ_all   <- bind_rows(lapply(res_list, `[[`, "summary"))
+  
+  n_fin <- sum(is.finite(curves_all$diff))
+  cat("Finite contrast values:", n_fin, "of", nrow(curves_all), "\n")
+  if (n_fin == 0) {
+    warning("All contrasts are NA for ", marker_tag,
+            ". Check for aliased coefficients above.")
+    return(invisible(NULL))
+  }
+  
+  curves_all <- curves_all %>% mutate(contrast = clean_text(contrast))
+  summ_all   <- summ_all %>%
+    mutate(contrast = clean_text(contrast),
+           seg_pos  = clean_text(seg_pos),
+           seg_neg  = clean_text(seg_neg),
+           note     = clean_text(note))
+  
+  curves_file <- paste0("WITHIN_CURVES_", marker_tag, "_hasta_desde_SIMULTANEOUS95CI.csv")
+  summ_file   <- paste0("WITHIN_SUMMARY_", marker_tag, "_hasta_desde_SIMULTANEOUS95CI.csv")
+  write_csv_utf8_bom(curves_all, curves_file)
+  write_csv_utf8_bom(summ_all,   summ_file)
+  
+  cat("Saved (UTF-8 BOM):\n  -", curves_file, "\n  -", summ_file, "\n")
+  
+  labels_all <- bind_rows(
+    lapply(split(curves_all, curves_all$contrast),
+           make_shade_boundary_labels, unit_suffix = unit_suffix)
+  )
+  
+  ## with no significant segment anywhere, bind_rows of NULLs gives a
+  ## 0 x 0 tibble and the filter below would fail on a missing column
+  if (is.null(labels_all) || !nrow(labels_all) ||
+      !("contrast" %in% names(labels_all))) {
+    labels_all <- data.frame(
+      contrast = character(0), x_raw = numeric(0),
+      y = numeric(0), label = character(0), hjust = numeric(0)
+    )
+  }
+  
+  cat("\n---- Ranges where the simultaneous band excludes zero ----\n")
+  print(as.data.frame(summ_all %>%
+                        select(contrast, seg_pos, seg_neg, simultaneous_critical)))
+  cat("\nsimultaneous_critical is the multiplier replacing 1.96. It is\n")
+  cat("larger because the band must hold across all 200 densities at\n")
+  cat("once. A range reported here survives multiplicity (point 5).\n")
+  
+  ## every contrast is shown; there are only three
+  curves_plot <- curves_all %>%
+    mutate(contrast = factor(contrast, levels = sort(unique(contrast))))
+  
+  labels_plot <- if (nrow(labels_all))
+    labels_all %>% mutate(contrast = factor(contrast,
+                                            levels = levels(curves_plot$contrast))) else NULL
+  
+  title_clean <- paste0(
+    "Primigravidae vs multigravidae in ", marker_tag,
+    "\nat matched qPCR density, within each site",
+    "\n(simultaneous 95% confidence band)"
+  )
+  
+  p_all <- plot_contrast_curves(
+    curves_plot, labels_plot,
+    title_txt  = title_clean,
+    colour_hex = colour_hex,
+    x_label    = "qPCR parasite density (parasites/µL; log scale)",
+    y_expr     = y_expr,
+    x_limits   = x_limits_shared,
+    x_breaks   = x_breaks_shared
+  ) +
+    facet_wrap(~ contrast, ncol = 3, scales = "free_y")
+  
+  cat("\n--- Printing HASTA/DESDE plot:", marker_tag, "---\n")
+  print(p_all)
+  
+  out_png <- paste0("WITHIN_HASTA_DESDE_", marker_tag, "_SIMULTANEOUS95CI.png")
+  out_pdf <- paste0("WITHIN_HASTA_DESDE_", marker_tag, "_SIMULTANEOUS95CI.pdf")
+  
+  saved_png <- safe_ggsave(out_png, p_all, width = 15, height = 5.5, dpi = 700)
+  saved_pdf <- safe_ggsave(out_pdf, p_all, width = 15, height = 5.5,
+                           device = grDevices::cairo_pdf)
+  
+  cat("Saved:\n  -", saved_png, "\n  -", saved_pdf, "\n")
+  
+  invisible(list(curves = curves_all, summary = summ_all,
+                 labels = labels_all, plot = p_all))
+}
+
+if (is.finite(COMMON_C_LOW) && is.finite(COMMON_C_HIGH) && COMMON_C_LOW < COMMON_C_HIGH) {
+  X_MIN_SHARED <- pmax(exp(COMMON_C_LOW  + MU_LOG_DENSITY), 1e-8)
+  X_MAX_SHARED <- pmax(exp(COMMON_C_HIGH + MU_LOG_DENSITY), 1e-8)
+} else {
+  raw_vec <- data$density
+  raw_vec <- raw_vec[is.finite(raw_vec) & !is.na(raw_vec) & raw_vec > 0]
+  X_MIN_SHARED <- as.numeric(quantile(raw_vec, 0.01, na.rm = TRUE))
+  X_MAX_SHARED <- as.numeric(quantile(raw_vec, 0.99, na.rm = TRUE))
+}
+
+X_LIMITS_SHARED <- c(X_MIN_SHARED, X_MAX_SHARED)
+X_BREAKS_SHARED <- make_log_breaks(X_LIMITS_SHARED)
+
+cat("\nHasta/desde significance uses SIMULTANEOUS 95% confidence bands\n")
+cat("across the full density curve. Pointwise p < 0.05 is NOT used to\n")
+cat("define the significant density ranges.\n")
+
+cat("\nShared qPCR x-axis for hasta/desde plots:\n")
+cat("Limits:", signif(X_LIMITS_SHARED[1], 4), "to", signif(X_LIMITS_SHARED[2], 4), "\n")
+cat("Breaks:", paste(X_BREAKS_SHARED, collapse = ", "), "\n")
+
+res_hasta_hrp2 <- run_hasta_desde_within_site(
+  model_obj        = model_pfhrp2_total,
+  marker_tag       = "HRP2",
+  colour_hex       = burgundy,
+  y_expr           = expression("HRP2 difference (log scale)"),
+  unit_suffix      = "p/µL",
+  x_limits_shared  = X_LIMITS_SHARED,
+  x_breaks_shared  = X_BREAKS_SHARED
+)
+
+res_hasta_pfldh <- run_hasta_desde_within_site(
+  model_obj        = model_pfldh_total,
+  marker_tag       = "PfLDH",
+  colour_hex       = blue,
+  y_expr           = expression("PfLDH difference (log scale)"),
+  unit_suffix      = "p/µL",
+  x_limits_shared  = X_LIMITS_SHARED,
+  x_breaks_shared  = X_BREAKS_SHARED
+)
+
+## ============================================================
+## 11) MAGNITUDE of significant differences
+## ============================================================
+trapz <- function(x, y) {
+  ok <- is.finite(x) & is.finite(y) & !is.na(x) & !is.na(y)
+  x <- x[ok]; y <- y[ok]
+  if (length(x) < 2) return(NA_real_)
+  o <- order(x); x <- x[o]; y <- y[o]
+  sum((y[-1] + y[-length(y)]) / 2 * diff(x))
+}
+
+add_segment_id <- function(flag) {
+  flag <- as.logical(flag)
+  flag[is.na(flag)] <- FALSE
+  r <- rle(flag)
+  seg_id <- rep(NA_integer_, length(flag))
+  idx_end <- cumsum(r$lengths)
+  idx_start <- idx_end - r$lengths + 1
+  k <- 0L
+  for (i in seq_along(r$values)) {
+    if (isTRUE(r$values[i])) {
+      k <- k + 1L
+      seg_id[idx_start[i]:idx_end[i]] <- k
+    }
+  }
+  seg_id
+}
+
+summarise_magnitude_from_curves <- function(curves_df, marker_tag) {
+  if (is.null(curves_df) || !nrow(curves_df)) return(tibble::tibble())
+  
+  df <- curves_df %>%
+    dplyr::mutate(
+      marker   = marker_tag,
+      contrast = clean_text(.data$contrast),
+      x_raw    = as.numeric(.data$x_raw),
+      diff     = as.numeric(.data$diff),
+      sig_pos  = as.logical(.data$sig_pos),
+      sig_neg  = as.logical(.data$sig_neg)
+    ) %>%
+    dplyr::filter(is.finite(x_raw), x_raw > 0) %>%
+    dplyr::arrange(contrast, x_raw)
+  
+  if (!nrow(df)) return(tibble::tibble())
+  
+  one <- function(dsub, key, flag_col, dir) {
+    dsub <- dsub %>%
+      dplyr::arrange(x_raw) %>%
+      dplyr::mutate(
+        flag = as.logical(.data[[flag_col]]),
+        log10x = log10(x_raw),
+        ratio_1p = exp(diff),
+        pct_1p   = (exp(diff) - 1) * 100
+      )
+    dsub$flag[is.na(dsub$flag)] <- FALSE
+    if (!any(dsub$flag)) return(tibble::tibble())
+    
+    dsub <- dsub %>% dplyr::mutate(seg_id = add_segment_id(flag))
+    
+    core <- function(d) {
+      w <- max(d$log10x) - min(d$log10x)
+      tibble::tibble(
+        n_points = nrow(d),
+        density_min = min(d$x_raw), density_max = max(d$x_raw),
+        log10_range = w,
+        mean_diff_log1p = mean(d$diff), median_diff_log1p = stats::median(d$diff),
+        mean_ratio_1p = mean(d$ratio_1p), median_ratio_1p = stats::median(d$ratio_1p),
+        mean_pct_1p = mean(d$pct_1p), median_pct_1p = stats::median(d$pct_1p),
+        avg_diff_log1p_per_log10 = if (is.finite(w) && w > 0) trapz(d$log10x, d$diff)/w else NA_real_,
+        avg_pct_1p_per_log10     = if (is.finite(w) && w > 0) trapz(d$log10x, d$pct_1p)/w else NA_real_
+      )
+    }
+    
+    overall <- dsub %>% dplyr::filter(flag) %>% core() %>%
+      dplyr::mutate(marker = marker_tag, contrast = key, direction = dir,
+                    level = "overall", seg_id = NA_integer_)
+    
+    segs <- dsub %>% dplyr::filter(!is.na(seg_id)) %>% split(.$seg_id) %>%
+      lapply(function(d) core(d) %>% dplyr::mutate(seg_id = d$seg_id[1])) %>%
+      dplyr::bind_rows()
+    if (nrow(segs)) segs <- segs %>%
+      dplyr::mutate(marker = marker_tag, contrast = key, direction = dir, level = "segment")
+    
+    dplyr::bind_rows(overall, segs)
+  }
+  
+  spl <- split(df, df$contrast, drop = TRUE)
+  res <- lapply(names(spl), function(cc)
+    dplyr::bind_rows(one(spl[[cc]], cc, "sig_pos", "sig_pos"),
+                     one(spl[[cc]], cc, "sig_neg", "sig_neg"))) %>%
+    dplyr::bind_rows()
+  
+  if (!nrow(res) || !("marker" %in% names(res))) {
+    cat("  (", marker_tag, ": no significant interval in any contrast)\n", sep = "")
+    return(tibble::tibble())
+  }
+  
+  res %>%
+    dplyr::mutate(direction = factor(direction, levels = c("sig_pos","sig_neg"))) %>%
+    dplyr::select(marker, contrast, direction, level, seg_id, dplyr::everything())
+}
+
+mag_hrp2  <- summarise_magnitude_from_curves(
+  if (!is.null(res_hasta_hrp2))  res_hasta_hrp2$curves  else NULL, "HRP2")
+mag_pfldh <- summarise_magnitude_from_curves(
+  if (!is.null(res_hasta_pfldh)) res_hasta_pfldh$curves else NULL, "PfLDH")
+
+mag_all <- dplyr::bind_rows(mag_hrp2, mag_pfldh)
+
+if (nrow(mag_all)) {
+  write_csv_utf8_bom(mag_all, "WITHIN_MAGNITUDE_HASTA_DESDE_ALL_SIMULTANEOUS95CI.csv")
+  cat("\n--- OVERALL significant intervals ---\n")
+  print(as.data.frame(mag_all %>%
+                        dplyr::filter(level == "overall") %>%
+                        dplyr::mutate(dplyr::across(c(median_ratio_1p, median_pct_1p), ~ round(.x, 2))) %>%
+                        dplyr::select(marker, contrast, direction, density_min, density_max,
+                                      median_ratio_1p, median_pct_1p)))
+} else {
+  cat("\nNo density interval survives the simultaneous band, for either\n")
+  cat("marker. With multiplicity controlled across the curve, there is\n")
+  cat("no density range in which the groups differ. The levels table\n")
+  cat("above is then the complete summary of the excess.\n")
+}
+
+## ============================================================
+## 12) Combined figure
+## ============================================================
+png_to_gg <- function(path) {
+  if (!file.exists(path)) stop("File not found: ", path)
+  img  <- png::readPNG(path)
+  grob <- grid::rasterGrob(img, width = unit(1, "npc"), height = unit(1, "npc"),
+                           interpolate = TRUE)
+  ggplot() +
+    annotation_custom(grob, xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf) +
+    theme_void() + theme(plot.margin = margin(0, 0, 0, 0))
+}
+
+f_A <- "WITHIN_FOREST_LEVELS_HRP2_PfLDH.png"
+f_B <- "WITHIN_LINES_adjusted_antigen_density.png"
+
+if (file.exists(f_A) && file.exists(f_B)) {
+  pA <- png_to_gg(f_A) + labs(tag = "A")
+  pB <- png_to_gg(f_B) + labs(tag = "B")
+  
+  p_AB <- (pA / pB) +
+    patchwork::plot_layout(heights = c(1, 1.5)) &
+    theme(plot.tag = element_text(face = "bold", size = 20),
+          plot.tag.position = c(0.02, 0.98))
+  
+  print(p_AB)
+  
+  safe_ggsave("WITHIN_FIG_AB_LEVELS_plus_LINES.png", p_AB,
+              width = 16, height = 14, dpi = 1000)
+  safe_ggsave("WITHIN_FIG_AB_LEVELS_plus_LINES.pdf", p_AB,
+              width = 16, height = 14, device = grDevices::cairo_pdf)
+  
+  cat("Saved:\n - WITHIN_FIG_AB_LEVELS_plus_LINES.png\n")
+  cat(" - WITHIN_FIG_AB_LEVELS_plus_LINES.pdf\n")
+}
+
+## ============================================================
+## 13) CUBIC-SPLINE HASTA/DESDE, within site
+##
+## The spline analysis is visualised through the SAME hasta/desde
+## contrast machinery as the linear model. The only difference is
+## that the density term is ns(c_log_density, df = 3), evaluated at
+## every point of the grid using the knots stored in the model.
+## ============================================================
+cat("\n============================================================\n")
+cat("CUBIC-SPLINE HASTA/DESDE, WITHIN SITE\n")
+cat("============================================================\n")
+
+res_hasta_hrp2_spline <- run_hasta_desde_within_site(
+  model_obj        = model_pfhrp2_spline_joint,
+  marker_tag       = "HRP2_cubic_spline",
+  colour_hex       = burgundy,
+  y_expr           = expression("HRP2 difference (log scale)"),
+  unit_suffix      = "p/µL",
+  x_limits_shared  = X_LIMITS_SHARED,
+  x_breaks_shared  = X_BREAKS_SHARED
+)
+
+res_hasta_pfldh_spline <- run_hasta_desde_within_site(
+  model_obj        = model_pfldh_spline_joint,
+  marker_tag       = "PfLDH_cubic_spline",
+  colour_hex       = blue,
+  y_expr           = expression("PfLDH difference (log scale)"),
+  unit_suffix      = "p/µL",
+  x_limits_shared  = X_LIMITS_SHARED,
+  x_breaks_shared  = X_BREAKS_SHARED
+)
+
+mag_spline_all <- dplyr::bind_rows(
+  summarise_magnitude_from_curves(
+    if (!is.null(res_hasta_hrp2_spline)) res_hasta_hrp2_spline$curves else NULL,
+    "HRP2_cubic_spline"),
+  summarise_magnitude_from_curves(
+    if (!is.null(res_hasta_pfldh_spline)) res_hasta_pfldh_spline$curves else NULL,
+    "PfLDH_cubic_spline")
+)
+
+if (nrow(mag_spline_all)) {
+  write_csv_utf8_bom(mag_spline_all,
+                     "WITHIN_MAGNITUDE_HASTA_DESDE_cubic_spline_SIMULTANEOUS95CI.csv")
+  cat("\n--- Cubic-spline significant intervals, within site ---\n")
+  print(as.data.frame(mag_spline_all %>%
+                        dplyr::filter(level == "overall") %>%
+                        dplyr::select(marker, contrast, direction, density_min, density_max,
+                                      median_ratio_1p)))
+} else {
+  cat("\nNo within-site interval survives the simultaneous band in the\n")
+  cat("cubic-spline models.\n")
+}
+
+## ---- spline levels contrasts, within site ----
+at_list <- setNames(list(c_at), slope_var)
+
+emm_h_sp <- emmeans(model_pfhrp2_spline_joint, ~ gravidity * centro, at = at_list)
+emm_l_sp <- emmeans(model_pfldh_spline_joint,  ~ gravidity * centro, at = at_list)
+
+lev_h_sp <- tidy_contrasts(
+  contrast(emm_h_sp, method = make_methods_within_site(emm_h_sp), adjust = "sidak"),
+  contrast(emm_h_sp, method = make_methods_within_site(emm_h_sp), adjust = "none"),
+  "HRP2 level (spline)")
+
+lev_l_sp <- tidy_contrasts(
+  contrast(emm_l_sp, method = make_methods_within_site(emm_l_sp), adjust = "sidak"),
+  contrast(emm_l_sp, method = make_methods_within_site(emm_l_sp), adjust = "none"),
+  "PfLDH level (spline)")
+
+write.csv(dplyr::bind_rows(fold_cols(lev_h_sp), fold_cols(lev_l_sp)),
+          "WITHIN_LEVELS_contrasts_cubic_spline.csv", row.names = FALSE)
+
+cat("\n---- WITHIN-SITE excess, spline model ----\n")
+print(as.data.frame(dplyr::bind_rows(fold_cols(lev_h_sp), fold_cols(lev_l_sp)) %>%
+                      dplyr::mutate(dplyr::across(c(fold, fold_low, fold_high), ~ round(.x, 2)),
+                                    p_sidak = signif(p_sidak, 3)) %>%
+                      dplyr::select(model, contrast, fold, fold_low, fold_high, p_sidak)))
+
+## ============================================================
+## 14) SAVE ALL FINAL MODEL OBJECTS
+## ============================================================
+saveRDS(
+  list(
+    screening_LRT = screening_lrt_results,
+    HRP2_linear_joint = model_pfhrp2_total,
+    PfLDH_linear_joint = model_pfldh_total,
+    HRP2_cubic_spline_joint = model_pfhrp2_spline_joint,
+    PfLDH_cubic_spline_joint = model_pfldh_spline_joint
+  ),
+  "WITHIN_AUTOMATED_JOINT_MODELS_linear_and_cubic_spline_left_censored.rds"
+)
+
+cat("\nSaved: WITHIN_AUTOMATED_JOINT_MODELS_linear_and_cubic_spline_left_censored.rds\n")
+
+cat("\n============================================================\n")
+cat("All contrasts are primigravidae vs multigravidae WITHIN a site,\n")
+cat("so site is held constant and the comparison is not confounded\n")
+cat("by transmission intensity (reviewer point 7). Three contrasts\n")
+cat("per marker, Sidak-adjusted.\n\n")
+cat("Values below the LLOQ are left-censored, and all qPCR-positive\n")
+cat("infections are included (points 2 and 3). Density-specific\n")
+cat("ranges use simultaneous 95% bands (point 5). The spline refit\n")
+cat("tests the functional form (point 6).\n")
+cat("============================================================\n")
+
+## ============================================================
+## SETTINGS USED
+##
+## The two ANTIGEN scripts must report the same fitted n. If one
+## says 288 and the other 382, the common-support switch is set
+## differently in the two and the results are not comparable.
+## ============================================================
+cat("\n================ SETTINGS USED =================\n")
+cat("Script:", SCRIPT_TAG, "\n")
+cat("Common support applied to data:", APPLY_COMMON_SUPPORT_TO_DATA, "\n")
+cat("Rows fitted (HRP2 / PfLDH):", n_hrp2, "/", n_ldh, "\n")
+cat("Output folder:", getwd(), "\n")
+    
