@@ -1,0 +1,81 @@
+## ============================================================
+## Reference parasite density used by the level contrasts
+##
+## Run in the SAME R session, after the automated pipeline has
+## finished. Nothing is refitted; this only reports the centring
+## constant and translates it back to parasites/uL, which is the
+## value the Results quote as the density at which the groups are
+## compared.
+##
+## In the pipeline, log_density = log(density) (natural log, no +1)
+## and c_log_density = log_density - MU_LOG_DENSITY, so
+## exp(MU_LOG_DENSITY) is the GEOMETRIC mean density.
+## ============================================================
+
+stopifnot(exists("data"), exists("MU_LOG_DENSITY"))
+
+d        <- data$density[is.finite(data$density)]
+geo_mean <- exp(MU_LOG_DENSITY)
+
+cat("\n=============== PARASITE DENSITY, ANALYSIS SET ===============\n")
+cat(sprintf("n with a density value         : %d\n", length(d)))
+cat(sprintf("Centring constant mean log(d)  : %.6f   (natural log)\n",
+            MU_LOG_DENSITY))
+cat(sprintf("GEOMETRIC mean density         : %.4g parasites/uL   <-- reference\n",
+            geo_mean))
+cat(sprintf("Arithmetic mean density        : %.4g parasites/uL\n", mean(d)))
+cat(sprintf("Median density                 : %.4g parasites/uL\n", median(d)))
+cat(sprintf("Interquartile range            : %.4g to %.4g parasites/uL\n",
+            quantile(d, 0.25), quantile(d, 0.75)))
+cat(sprintf("Range                          : %.4g to %.4g parasites/uL\n",
+            min(d), max(d)))
+
+## Did the centring do what it should?
+cat(sprintf("\nmean(c_log_density) = %.3e   (should be ~0)\n",
+            mean(data$c_log_density, na.rm = TRUE)))
+cat(sprintf("c_log_density = 0 corresponds to %.4g parasites/uL\n", geo_mean))
+
+## ---- the point the contrasts were ACTUALLY evaluated at ----
+## The pipeline uses c_at, which it moves to the midpoint of common
+## support if 0 falls outside it. If c_at is not 0, the contrasts are
+## not at the geometric mean and the Results must say so.
+if (exists("c_at")) {
+  cat(sprintf("\nEMMEANS evaluation point c_at  : %.6f  ->  %.4g parasites/uL\n",
+              c_at, exp(c_at + MU_LOG_DENSITY)))
+  if (abs(c_at) > 1e-8) {
+    cat("NOTE: c_at is NOT zero. The level contrasts are evaluated at the\n")
+    cat("      density printed above, not at the geometric mean. Quote that\n")
+    cat("      value in the Results instead.\n")
+  } else {
+    cat("c_at is zero, so the contrasts are at the geometric mean.\n")
+  }
+} else {
+  cat("\nc_at not found in the session; re-run the pipeline section that\n")
+  cat("builds the level contrasts before this script.\n")
+}
+
+## ---- common support, on the raw scale ----
+if (exists("COMMON_C_LOW") && exists("COMMON_C_HIGH") &&
+    is.finite(COMMON_C_LOW) && is.finite(COMMON_C_HIGH)) {
+  cat(sprintf("\nCommon support                 : %.4g to %.4g parasites/uL\n",
+              exp(COMMON_C_LOW  + MU_LOG_DENSITY),
+              exp(COMMON_C_HIGH + MU_LOG_DENSITY)))
+  cat(sprintf("Reference inside common support: %s\n",
+              if (0 >= COMMON_C_LOW && 0 <= COMMON_C_HIGH) "yes" else "NO - check"))
+}
+
+## ---- per model, because the fitted samples differ ----
+## Complete-case dropping means each model's own mean density is not
+## exactly the centring constant. The contrasts still use the shared
+## c_at, so these are reported only to show how far apart they are.
+for (nm in c("model_pfhrp2_total", "model_pfldh_total")) {
+  if (!exists(nm)) next
+  cl <- model.frame(get(nm))[["c_log_density"]]
+  if (is.null(cl)) next
+  cat(sprintf("\n%-20s n = %3d, geometric mean of its fitted sample = %.4g parasites/uL\n",
+              nm, length(cl), exp(mean(cl, na.rm = TRUE) + MU_LOG_DENSITY)))
+}
+
+cat("\n-------------------------------------------------------------\n")
+cat("For the Results sentence, quote the density on the 'c_at' line.\n")
+cat("-------------------------------------------------------------\n")
